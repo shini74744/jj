@@ -9,12 +9,12 @@ get_optimal_threads() {
 # 随机选择测速地址
 get_random_speedtest_url() {
     local urls=(
-        "http://ipv4.download.thinkbroadband.com/10MB.zip"
-        "http://ipv4.speedtest.tele2.net/10MB.zip"
-        "http://speed.hetzner.de/10MB.bin"
-        "http://ipv4.download.oracle.com/otn-pub/java/jdk/8u144-b01/jdk-8u144-linux-x64.tar.gz"
-        "http://ipv4.download.testdebit.info/10MB.zip"
-        "http://mirror.centos.org/centos/8/isos/x86_64/"
+        "https://speed.hetzner.de/10MB.bin"               # Hetzner 服务器测速
+        "http://ipv4.download.testdebit.info/10MB.zip"    # Testdebit 测试地址
+        "http://mirror.centos.org/centos/8/isos/x86_64/CentOS-8-x86_64-1905-dvd1.iso"  # CentOS 官方镜像
+        "https://ftp.fau.de/mirror/iso/openbsd/7.0/amd64/opensbsd-7.0-amd64.iso"  # OpenBSD 官方镜像
+        "http://mirror.fibergrid.in/ubuntu-releases/20.04/ubuntu-20.04.3-live-server-amd64.iso"  # Ubuntu 镜像
+        "http://ipv4.download.oracle.com/otn-pub/java/jdk/8u171-b11/jdk-8u171-linux-x64.tar.gz"  # Oracle JDK
     )
     echo ${urls[$RANDOM % ${#urls[@]}]}
 }
