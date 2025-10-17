@@ -1,101 +1,91 @@
-import os
-import threading
-import requests
-import time
-import random
+#!/bin/bash
 
 # 获取VPS性能来自动选择线程数量
-def get_optimal_threads():
-    cpu_count = os.cpu_count()
-    return cpu_count * 2  # 以CPU核心数的两倍作为默认线程数
+get_optimal_threads() {
+    local cpu_count=$(nproc)  # 获取CPU核心数
+    echo $((cpu_count * 2))   # 根据核心数推荐线程数，通常2倍核心数
+}
 
 # 随机选择测速地址
-def get_random_speedtest_url():
-    urls = [
-        "http://ipv4.download.thinkbroadband.com/10MB.zip",  # 可下载测试文件
-        "http://ipv4.speedtest.tele2.net/10MB.zip",  # 另一个测速地址
-        "http://speed.hetzner.de/10MB.bin"  # Hetzner测速地址
-    ]
-    return random.choice(urls)
+get_random_speedtest_url() {
+    local urls=(
+        "http://ipv4.download.thinkbroadband.com/10MB.zip"
+        "http://ipv4.speedtest.tele2.net/10MB.zip"
+        "http://speed.hetzner.de/10MB.bin"
+    )
+    echo ${urls[$RANDOM % ${#urls[@]}]}
+}
 
 # 测试下载流量
-def download_speed(url, thread_count):
-    def download_chunk():
-        try:
-            response = requests.get(url, stream=True)
-            for _ in response.iter_content(chunk_size=1024 * 1024):  # 每次下载1MB
-                pass
-        except Exception as e:
-            print(f"Error in downloading: {e}")
-
-    threads = []
-    for _ in range(thread_count):
-        thread = threading.Thread(target=download_chunk)
-        threads.append(thread)
-        thread.start()
-
-    for thread in threads:
-        thread.join()
+download_speed() {
+    local url=$1
+    local thread_count=$2
+    for ((i=0; i<thread_count; i++)); do
+        wget -q --spider --no-check-certificate "$url" &
+    done
+    wait
+}
 
 # 测试上传流量
-def upload_speed(url, thread_count):
-    def upload_chunk():
-        try:
-            data = os.urandom(1024 * 1024)  # 每次上传1MB的随机数据
-            response = requests.post(url, data=data)
-        except Exception as e:
-            print(f"Error in uploading: {e}")
-
-    threads = []
-    for _ in range(thread_count):
-        thread = threading.Thread(target=upload_chunk)
-        threads.append(thread)
-        thread.start()
-
-    for thread in threads:
-        thread.join()
+upload_speed() {
+    local url=$1
+    local thread_count=$2
+    for ((i=0; i<thread_count; i++)); do
+        dd if=/dev/urandom bs=1M count=10 | curl -X POST --data-binary @- "$url" &
+    done
+    wait
+}
 
 # 显示菜单并执行相应操作
-def display_menu():
-    print("===== VPS 流量消耗脚本 =====")
-    print("1. 开始测速消耗")
-    print("2. 退出")
-    choice = input("请选择操作（1/2）: ")
+display_menu() {
+    echo "===== VPS 流量消耗脚本 ====="
+    echo "1. 开始测速消耗"
+    echo "2. 退出"
+    read -p "请选择操作（1/2）: " choice
     
-    if choice == "1":
-        # 选择线程数
-        thread_count_input = input(f"请输入线程数量（默认根据VPS性能选择，当前推荐 {get_optimal_threads()}）：")
-        thread_count = int(thread_count_input) if thread_count_input else get_optimal_threads()
+    case $choice in
+        1)
+            # 选择线程数
+            read -p "请输入线程数量（默认根据VPS性能选择，当前推荐 $(get_optimal_threads)）： " thread_count
+            thread_count=${thread_count:-$(get_optimal_threads)}  # 如果没有输入，使用默认值
+            
+            # 选择测速地址
+            read -p "请输入测速地址（默认随机选择，当前选择 $(get_random_speedtest_url)）： " url
+            url=${url:-$(get_random_speedtest_url)}  # 如果没有输入，使用随机地址
 
-        # 选择测速地址
-        url_input = input(f"请输入测速地址（默认随机选择，当前选择 {get_random_speedtest_url()}）：")
-        url = url_input if url_input else get_random_speedtest_url()
+            # 选择上传还是下载
+            read -p "选择测速模式（1: 下载 2: 上传 3: 同时）: " mode
+            case $mode in
+                1)
+                    echo "开始下载测速..."
+                    download_speed "$url" "$thread_count"
+                    ;;
+                2)
+                    echo "开始上传测速..."
+                    upload_speed "$url" "$thread_count"
+                    ;;
+                3)
+                    echo "开始下载和上传测速..."
+                    download_speed "$url" "$thread_count" &
+                    upload_speed "$url" "$thread_count" &
+                    wait
+                    ;;
+                *)
+                    echo "无效选择，请重新运行程序。"
+                    ;;
+            esac
+            ;;
+        2)
+            echo "退出程序。"
+            exit 0
+            ;;
+        *)
+            echo "无效选择，请重新选择。"
+            ;;
+    esac
+}
 
-        # 选择上传还是下载
-        mode_input = input("选择测速模式（1: 下载 2: 上传 3: 同时）: ")
-        if mode_input == "1":
-            print("开始下载测速...")
-            download_speed(url, thread_count)
-        elif mode_input == "2":
-            print("开始上传测速...")
-            upload_speed(url, thread_count)
-        elif mode_input == "3":
-            print("开始下载和上传测速...")
-            download_thread = threading.Thread(target=download_speed, args=(url, thread_count))
-            upload_thread = threading.Thread(target=upload_speed, args=(url, thread_count))
-            download_thread.start()
-            upload_thread.start()
-            download_thread.join()
-            upload_thread.join()
-        else:
-            print("无效选择，请重新运行程序。")
-    
-    elif choice == "2":
-        print("退出程序。")
-        exit()
-    else:
-        print("无效选择，请重新选择。")
-
-if __name__ == "__main__":
-    while True:
-        display_menu()
+# 主程序
+while true; do
+    display_menu
+done
