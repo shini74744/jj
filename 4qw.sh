@@ -9,12 +9,7 @@ get_optimal_threads() {
 # 随机选择测速地址
 get_random_speedtest_url() {
     local urls=(
-        "https://speed.hetzner.de/10MB.bin"               # Hetzner 服务器测速
-        "http://ipv4.download.testdebit.info/10MB.zip"    # Testdebit 测试地址
-        "http://mirror.centos.org/centos/8/isos/x86_64/CentOS-8-x86_64-1905-dvd1.iso"  # CentOS 官方镜像
-        "https://ftp.fau.de/mirror/iso/openbsd/7.0/amd64/opensbsd-7.0-amd64.iso"  # OpenBSD 官方镜像
-        "http://mirror.fibergrid.in/ubuntu-releases/20.04/ubuntu-20.04.3-live-server-amd64.iso"  # Ubuntu 镜像
-        "http://ipv4.download.oracle.com/otn-pub/java/jdk/8u171-b11/jdk-8u171-linux-x64.tar.gz"  # Oracle JDK
+        "https://speed.cloudflare.com/__down?bytes=104857600"   # Cloudflare 100MB测速
     )
     echo ${urls[$RANDOM % ${#urls[@]}]}
 }
@@ -39,8 +34,20 @@ check_url() {
 download_speed() {
     local url=$1
     local thread_count=$2
+    local total_downloaded=0
     for ((i=0; i<thread_count; i++)); do
-        wget -q --spider --no-check-certificate "$url" &
+        wget --spider --no-check-certificate "$url" --progress=dot -O /dev/null 2>&1 | \
+        grep --line-buffered "%" | \
+        while read -r line; do
+            # 提取下载进度百分比
+            progress=$(echo $line | awk '{print $2}' | sed 's/%//')
+            if [[ ! -z "$progress" ]]; then
+                # 计算下载进度，假设每次下载10MB
+                total_downloaded=$((total_downloaded + 10))  # 每次下载10MB
+                echo "当前下载进度: ${progress}%"
+                echo "当前总下载流量: ${total_downloaded}MB"
+            fi
+        done &
     done
     wait
 }
@@ -50,14 +57,21 @@ upload_speed() {
     local url=$1
     local thread_count=$2
     local retries=3  # 设置最大重试次数
+    local total_uploaded=0
     for ((i=0; i<thread_count; i++)); do
         attempt=1
         while [[ $attempt -le $retries ]]; do
             echo "上传尝试 $attempt/$retries"
-            dd if=/dev/urandom bs=1M count=10 | curl -X POST --data-binary @- "$url" && break
-            echo "上传失败，正在重试..."
-            ((attempt++))
-            sleep 2  # 重试前等待2秒
+            result=$(dd if=/dev/urandom bs=1M count=10 | curl -X POST --data-binary @- "$url" -w "%{size_download}" -o /dev/null)
+            if [[ $? -eq 0 ]]; then
+                total_uploaded=$((total_uploaded + result))
+                echo "上传成功，当前总上传流量: ${total_uploaded}MB"
+                break
+            else
+                echo "上传失败，正在重试..."
+                ((attempt++))
+                sleep 2  # 重试前等待2秒
+            fi
         done &
     done
     wait
@@ -104,8 +118,10 @@ display_menu() {
                 echo "没有有效的下载或上传地址，退出程序。"
                 exit 1
             fi
-            echo "有效下载测速地址： ${valid_download_urls[@]}"
-            echo "有效上传测速地址： ${valid_upload_urls[@]}"
+
+            # 输出下载地址和上传地址
+            echo "当前下载地址： ${valid_download_urls[0]}"
+            echo "当前上传地址： ${valid_upload_urls[0]}"
 
             # 选择测速模式
             read -p "选择测速模式（1: 下载 2: 上传 3: 同时）: " mode
