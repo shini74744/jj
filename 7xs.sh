@@ -114,7 +114,7 @@ auto_threads() {
   local cores=1
   if command -v nproc >/dev/null 2>&1; then cores=$(nproc)
   elif [[ -r /proc/cpuinfo ]]; then cores=$(grep -c '^processor' /proc/cpuinfo || echo 1); fi
-  local t=$(( cores * 2 )); (( t < 4 )) && t=4; (( t > 32 )) && t=32; echo "$t"
+  local t=$(( cores*2 )); (( t<4 )) && t=4; (( t>32 )) && t=32; echo "$t"
 }
 
 check_curl() {
@@ -270,7 +270,6 @@ curl_measure_upload() {
   # $1: URL   $2: BYTES   $3: 限速B/s
   local url="$1" bytes="$2" limit_bps="${3:-0}"
   local extra=(); (( limit_bps > 0 )) && extra+=(--limit-rate "$limit_bps")
-  # 生成 bytes 长度的零数据并 POST
   head -c "$bytes" /dev/zero | \
     curl -sS -L \
       "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
@@ -330,13 +329,11 @@ upload_worker() {
     local limit_bps; limit_bps=$(calc_ul_thread_bps)
     local chunk_bytes=$(( CHUNK_MB*1048576 ))
 
-    # 执行一次固定分块上传
     local res; res="$(curl_measure_upload "$final" "$chunk_bytes" "$limit_bps")"
     local bytes=0 code="000"
     if [[ -n "$res" ]]; then
       bytes="${res%% *}"; code="${res##* }"
     fi
-    # 仅统计成功上传的字节
     if [[ "$code" != "200" && "$code" != "204" && "$code" != "201" && "$code" != "202" ]]; then
       bytes=0
       sleep 1
@@ -462,7 +459,6 @@ stop_consumption() {
   [[ -f "$UL_TOTAL_FILE" ]] && ul_g=$(cat "$UL_TOTAL_FILE")
   echo "${C_BOLD}[*] 最终汇总：下载总计 ${C_CYAN}$(bytes_to_mb "$dl_g") MB${C_RESET}${C_BOLD}；上传总计 ${C_MAGENTA}$(bytes_to_mb "$ul_g") MB${C_RESET}"
 
-  # 清理计数文件
   cleanup_counters
   echo "${C_GREEN}[+] 已全部停止。${C_RESET}"
 }
@@ -470,6 +466,17 @@ stop_consumption() {
 #############################
 # 交互：启动（默认=3 同时）
 #############################
+list_download_urls() {
+  echo
+  echo "${C_BOLD}下载地址（共 ${#URLS[@]} 个）：${C_RESET}"
+  local i=0; for u in "${URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done
+}
+list_upload_urls() {
+  echo
+  echo "${C_BOLD}上传地址（共 ${#UPLOAD_URLS[@]} 个）：${C_RESET}"
+  local i=0; for u in "${UPLOAD_URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done
+}
+
 interactive_start() {
   echo; echo "${C_BOLD}请选择消耗模式：${C_RESET}"
   echo "  1) 下载（仅下行）"
@@ -488,26 +495,41 @@ interactive_start() {
   elif [[ "$t" =~ ^[0-9]+$ ]] && (( t > 0 )); then total_threads="$t"
   else echo "${C_YELLOW}[!] 非法输入，使用自动选择。${C_RESET}"; total_threads=$(auto_threads); fi
 
-  echo; show_urls
+  # ★★★ 改为：先显示要选的那个列表，再立刻询问该列表编号 ★★★
   if [[ "$MODE" != "u" ]]; then
+    list_download_urls
     read -rp "下载地址编号（逗号分隔，留空=全量随机）: " pick_dl || true
     parse_choice_to_array "${pick_dl:-}" URLS ACTIVE_URLS
-  else ACTIVE_URLS=(); fi
+  else
+    ACTIVE_URLS=()
+  fi
+
   if [[ "$MODE" != "d" ]]; then
+    list_upload_urls
     read -rp "上传地址编号（逗号分隔，留空=全量随机）: " pick_ul || true
     parse_choice_to_array "${pick_ul:-}" UPLOAD_URLS ACTIVE_UPLOAD_URLS
-  else ACTIVE_UPLOAD_URLS=(); fi
+  else
+    ACTIVE_UPLOAD_URLS=()
+  fi
 
   read -rp "运行多久（单位=小时，留空=一直运行）: " hours || true
-  if [[ -z "${hours// /}" ]]; then END_TS=0; echo "[*] 将一直运行，直到手动停止。"
+  if [[ -z "${hours// /}" ]]; then
+    END_TS=0; echo "[*] 将一直运行，直到手动停止。"
   elif [[ "$hours" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     local secs; secs=$(awk -v h="$hours" 'BEGIN{printf "%.0f", h*3600}')
     END_TS=$(( $(date +%s) + secs )); echo "[*] 预计运行 ${hours} 小时，至 $(date -d @"$END_TS" "+%F %T") 停止。"
-  else echo "${C_YELLOW}[!] 非法输入，改为一直运行。${C_RESET}"; END_TS=0; fi
+  else
+    echo "${C_YELLOW}[!] 非法输入，改为一直运行。${C_RESET}"; END_TS=0
+  fi
 
-  if [[ "$MODE" == "b" ]]; then DL_THREADS=$(( total_threads / 2 )); UL_THREADS=$(( total_threads - DL_THREADS ))
-  elif [[ "$MODE" == "d" ]]; then DL_THREADS="$total_threads"; UL_THREADS=0
-  else DL_THREADS=0; UL_THREADS="$total_threads"; fi
+  if [[ "$MODE" == "b" ]]; then
+    DL_THREADS=$(( total_threads / 2 ))
+    UL_THREADS=$(( total_threads - DL_THREADS ))
+  elif [[ "$MODE" == "d" ]]; then
+    DL_THREADS="$total_threads"; UL_THREADS=0
+  else
+    DL_THREADS=0; UL_THREADS="$total_threads"
+  fi
 
   start_consumption "$MODE" "$DL_THREADS" "$UL_THREADS"
 }
@@ -521,9 +543,16 @@ configure_summary() {
   [[ -z "${n// /}" ]] && { echo "未更改。"; return; }
   if [[ "$n" =~ ^[0-9]+$ ]]; then
     SUMMARY_INTERVAL="$n"
-    if (( SUMMARY_INTERVAL == 0 )); then stop_summary; echo "${C_GREEN}[+] 已关闭定时汇总。${C_RESET}"
-    else echo "${C_GREEN}[+] 设置为每 ${SUMMARY_INTERVAL}s 汇总一次。${C_RESET}"; is_summary_running && stop_summary; is_running && start_summary; fi
-  else echo "${C_YELLOW}[-] 输入无效，未更改。${C_RESET}"; fi
+    if (( SUMMARY_INTERVAL == 0 )); then
+      stop_summary; echo "${C_GREEN}[+] 已关闭定时汇总。${C_RESET}"
+    else
+      echo "${C_GREEN}[+] 设置为每 ${SUMMARY_INTERVAL}s 汇总一次。${C_RESET}"
+      is_summary_running && stop_summary
+      is_running && start_summary
+    fi
+  else
+    echo "${C_YELLOW}[-] 输入无效，未更改。${C_RESET}"
+  fi
 }
 
 #############################
@@ -561,7 +590,6 @@ configure_limits() {
     *) echo "${C_YELLOW}无效选择。${C_RESET}";;
   esac
 
-  # 提示每线程速率
   if (( DL_LIMIT_MB > 0 )) && (( DL_THREADS > 0 )); then
     local per=$(awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
     echo "  下载每线程≈ ${per} MB/s（curl --limit-rate）"
