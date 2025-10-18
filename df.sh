@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# 流量消耗/测速脚本（数字模式 + 彩色菜单 + 实时统计 + 定时汇总 + 仅脚本限速 + 强力清理）
-# 变更：分块分离(CHUNK_MB_DL/UL)、默认仅CF上行(留空时)、智能分配线程（偶数均分/奇数自动偏向更受限的一方或默认给上传）
+# 流量消耗/测速脚本（数字菜单 / 非交互守护 / 定时汇总 / 仅脚本限速 / 强清理）
+# - 支持交互菜单运行；也支持通过环境变量“非交互 AUTO 模式”，用于 systemd 无人值守
+# - 默认：IPv4、HTTP/1.1、固定分块；下载/上传块大小可分离；上传默认仅选 Cloudflare __up
+# - 同时模式线程“智能分配”：偶数均分；奇数把多出来的 1 个给更受限的一方（若未限速→给上传）
+# - Ctrl+C / SIGTERM 都会优雅收尾并打印最终汇总（systemd 停止时可从日志查看）
 
 set -Eeuo pipefail
 
@@ -17,13 +20,13 @@ ALWAYS_CHUNK=${ALWAYS_CHUNK:-1} # 1=总是按固定分块；0=先整段→失败
 
 # 分块分离（MB）
 CHUNK_MB_DL=${CHUNK_MB_DL:-50}  # 下载每块大小
-CHUNK_MB_UL=${CHUNK_MB_UL:-10}  # 上传每块大小（默认更小以提升上传打印频率）
+CHUNK_MB_UL=${CHUNK_MB_UL:-10}  # 上传每块大小（更小↑上传打印频率）
 
-# 启动后是否等到第一条线程输出再回到菜单
+# 启动后是否等到第一条线程输出再回到菜单（交互用）
 START_WAIT_FIRST_OUTPUT=${START_WAIT_FIRST_OUTPUT:-1}  # 1=开启, 0=关闭
-START_WAIT_SPINS=${START_WAIT_SPINS:-30}               # 最多等待次数；0.1s/次 → 30 ≈ 3秒
+START_WAIT_SPINS=${START_WAIT_SPINS:-30}               # 最多等待次数；0.1s/次 → 3秒
 
-# 颜色/样式
+# 颜色/样式（非 TTY 自动关闭颜色；systemd 日志更干净）
 init_colors() {
   if command -v tput >/dev/null 2>&1 && [[ -t 1 ]] && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; then
     C_RESET="$(tput sgr0)"; C_BOLD="$(tput bold)"; C_DIM="$(tput dim)"
@@ -36,6 +39,9 @@ init_colors() {
   fi
 }
 init_colors
+
+# 忽略 SSH 断开带来的 SIGHUP（systemd 下无所谓，nohup 时有用）
+trap '' HUP
 
 # 根据 IP_VERSION / FORCE_HTTP1 生成命令选项
 CURL_IP_OPT=(); HTTP_VER_OPT=()
@@ -67,7 +73,7 @@ URLS=(
   "https://speed.cloudflare.com/__down?bytes=104857600"
 )
 
-# 上传地址池（HTTP 直传；默认仅 CF 上行）
+# 上传地址池（HTTP 直传；留空时默认仅 CF __up）
 UPLOAD_URLS=(
   "https://speed.cloudflare.com/__up"
   "https://httpbin.org/post"
@@ -85,12 +91,13 @@ DL_THREADS=0
 UL_THREADS=0
 ACTIVE_URLS=()
 ACTIVE_UPLOAD_URLS=()
-MODE=""
+MODE=""                 # "d"/"u"/"b"
 COUNTER_DIR=""
 DL_TOTAL_FILE=""
 UL_TOTAL_FILE=""
-DL_LIMIT_MB=0
-UL_LIMIT_MB=0
+# 限速（总速，MB/s；0=不限）
+DL_LIMIT_MB=${DL_LIMIT_MB:-0}
+UL_LIMIT_MB=${UL_LIMIT_MB:-0}
 
 #############################
 # 工具函数
@@ -101,10 +108,7 @@ auto_threads() {
   local cores=1
   if command -v nproc >/dev/null 2>&1; then cores=$(nproc)
   elif [[ -r /proc/cpuinfo ]]; then cores=$(grep -c '^processor' /proc/cpuinfo || echo 1); fi
-  local t=$(( cores * 2 ))
-  (( t < 4 )) && t=4
-  (( t > 32 )) && t=32
-  echo "$t"
+  local t=$(( cores * 2 )); (( t < 4 )) && t=4; (( t > 32 )) && t=32; echo "$t"
 }
 
 check_curl() {
@@ -378,19 +382,15 @@ smart_split_threads() {
   if (( total % 2 == 0 )); then
     DL_THREADS=$(( total/2 )); UL_THREADS=$(( total/2 )); return
   fi
-  # 奇数：优先依据限速判断“更受限的一方”，否则默认给上传
-  # 仅 DL 有限速 → 额外给 DL；仅 UL 有限速 → 额外给 UL；两者都有 → 给限速更小的一方
-  extra_side="ul" # 默认给上传
-  dl_pos=$(awk -v x="$DL_LIMIT_MB" 'BEGIN{print (x>0)?1:0}')
-  ul_pos=$(awk -v x="$UL_LIMIT_MB" 'BEGIN{print (x>0)?1:0}')
+  # 奇数：依据限速把多出的 1 个给“更受限的一方”；无限速→给上传
+  local extra_side="ul"
+  local dl_pos=$(awk -v x="$DL_LIMIT_MB" 'BEGIN{print (x>0)?1:0}')
+  local ul_pos=$(awk -v x="$UL_LIMIT_MB" 'BEGIN{print (x>0)?1:0}')
   if (( dl_pos==1 || ul_pos==1 )); then
-    if (( dl_pos==1 && ul_pos==0 )); then
-      extra_side="dl"
-    elif (( dl_pos==0 && ul_pos==1 )); then
-      extra_side="ul"
+    if (( dl_pos==1 && ul_pos==0 )); then extra_side="dl"
+    elif (( dl_pos==0 && ul_pos==1 )); then extra_side="ul"
     else
-      # 两者都有：比大小，值小=更受限
-      cmp=$(awk -v dl="$DL_LIMIT_MB" -v ul="$UL_LIMIT_MB" 'BEGIN{if(dl<ul) print "dl"; else print "ul"}')
+      local cmp; cmp=$(awk -v dl="$DL_LIMIT_MB" -v ul="$UL_LIMIT_MB" 'BEGIN{if(dl<ul) print "dl"; else print "ul"}')
       extra_side="$cmp"
     fi
   fi
@@ -419,7 +419,7 @@ start_consumption() {
   fi
 
   start_summary
-  echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 或选菜单 2 可停止。${C_RESET}"
+  echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 或发送 SIGTERM 可停止。${C_RESET}"
   wait_first_output
 }
 
@@ -447,16 +447,10 @@ stop_consumption() {
 }
 
 #############################
-# 交互：启动（默认=3 同时）
+# 交互菜单（可选）
 #############################
-list_download_urls() {
-  echo; echo "${C_BOLD}下载地址（共 ${#URLS[@]} 个）：${C_RESET}"
-  local i=0; for u in "${URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done
-}
-list_upload_urls() {
-  echo; echo "${C_BOLD}上传地址（共 ${#UPLOAD_URLS[@]} 个）：${C_RESET}"
-  local i=0; for u in "${UPLOAD_URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done
-}
+list_download_urls() { echo; echo "${C_BOLD}下载地址（共 ${#URLS[@]} 个）：${C_RESET}"; local i=0; for u in "${URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done; }
+list_upload_urls() { echo; echo "${C_BOLD}上传地址（共 ${#UPLOAD_URLS[@]} 个）：${C_RESET}"; local i=0; for u in "${UPLOAD_URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done; }
 
 interactive_start() {
   echo; echo "${C_BOLD}请选择消耗模式：${C_RESET}"
@@ -465,10 +459,7 @@ interactive_start() {
   echo "  3) 同时（上下行）"
   read -rp "模式 [1-3]（默认 3）: " mode_num || true
   [[ -z "${mode_num// /}" ]] && mode_num=3
-  case "$mode_num" in
-    1) MODE="d" ;; 2) MODE="u" ;; 3) MODE="b" ;;
-    *) echo "${C_YELLOW}[!] 输入无效，使用默认：同时。${C_RESET}"; MODE="b" ;;
-  esac
+  case "$mode_num" in 1) MODE="d";; 2) MODE="u";; 3) MODE="b";; *) MODE="b";; esac
 
   read -rp "并发线程数（留空自动按 VPS 配置选择）: " t || true
   local total_threads
@@ -476,111 +467,42 @@ interactive_start() {
   elif [[ "$t" =~ ^[0-9]+$ ]] && (( t > 0 )); then total_threads="$t"
   else echo "${C_YELLOW}[!] 非法输入，使用自动选择。${C_RESET}"; total_threads=$(auto_threads); fi
 
-  if [[ "$MODE" != "u" ]]; then
-    list_download_urls
-    read -rp "下载地址编号（逗号分隔，留空=全量随机）: " pick_dl || true
-    parse_choice_to_array "${pick_dl:-}" URLS ACTIVE_URLS
-  else
-    ACTIVE_URLS=()
-  fi
-
-  if [[ "$MODE" != "d" ]]; then
-    list_upload_urls
-    read -rp "上传地址编号（逗号分隔，留空=默认仅 Cloudflare）: " pick_ul || true
-    if [[ -z "${pick_ul// /}" ]]; then
-      ACTIVE_UPLOAD_URLS=( "${UPLOAD_URLS[0]}" )
-      echo "[*] 未选择编号：默认仅使用 ${UPLOAD_URLS[0]}"
-    else
-      parse_choice_to_array "${pick_ul:-}" UPLOAD_URLS ACTIVE_UPLOAD_URLS
-    fi
-  else
-    ACTIVE_UPLOAD_URLS=()
-  fi
+  if [[ "$MODE" != "u" ]]; then list_download_urls; read -rp "下载地址编号（逗号分隔，留空=全量随机）: " pick_dl || true; parse_choice_to_array "${pick_dl:-}" URLS ACTIVE_URLS; else ACTIVE_URLS=(); fi
+  if [[ "$MODE" != "d" ]]; then list_upload_urls; read -rp "上传地址编号（逗号分隔，留空=默认仅 Cloudflare）: " pick_ul || true; if [[ -z "${pick_ul// /}" ]]; then ACTIVE_UPLOAD_URLS=( "${UPLOAD_URLS[0]}" ); echo "[*] 未选择编号：默认仅使用 ${UPLOAD_URLS[0]}"; else parse_choice_to_array "${pick_ul:-}" UPLOAD_URLS ACTIVE_UPLOAD_URLS; fi; else ACTIVE_UPLOAD_URLS=(); fi
 
   read -rp "运行多久（单位=小时，留空=一直运行）: " hours || true
-  if [[ -z "${hours// /}" ]]; then
-    END_TS=0; echo "[*] 将一直运行，直到手动停止。"
-  elif [[ "$hours" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-    local secs; secs=$(awk -v h="$hours" 'BEGIN{printf "%.0f", h*3600}')
-    END_TS=$(( $(date +%s) + secs )); echo "[*] 预计运行 ${hours} 小时，至 $(date -d @"$END_TS" "+%F %T") 停止。"
-  else
-    echo "${C_YELLOW}[!] 非法输入，改为一直运行。${C_RESET}"; END_TS=0
-  fi
+  if [[ -z "${hours// /}" ]]; then END_TS=0; echo "[*] 将一直运行，直到手动停止。"
+  elif [[ "$hours" =~ ^[0-9]+([.][0-9]+)?$ ]]; then local secs; secs=$(awk -v h="$hours" 'BEGIN{printf "%.0f", h*3600}'); END_TS=$(( $(date +%s) + secs )); echo "[*] 预计运行 ${hours} 小时，至 $(date -d @"$END_TS" "+%F %T") 停止。"
+  else echo "${C_YELLOW}[!] 非法输入，改为一直运行。${C_RESET}"; END_TS=0; fi
 
-  if [[ "$MODE" == "b" ]]; then
-    smart_split_threads "$total_threads"
-  elif [[ "$MODE" == "d" ]]; then
-    DL_THREADS="$total_threads"; UL_THREADS=0
-  else
-    DL_THREADS=0; UL_THREADS="$total_threads"
-  fi
+  if [[ "$MODE" == "b" ]]; then smart_split_threads "$total_threads"
+  elif [[ "$MODE" == "d" ]]; then DL_THREADS="$total_threads"; UL_THREADS=0
+  else DL_THREADS=0; UL_THREADS="$total_threads"; fi
 
   start_consumption "$MODE" "$DL_THREADS" "$UL_THREADS"
 }
 
-#############################
-# 定时汇总设置
-#############################
 configure_summary() {
   echo "当前定时汇总：$( ((SUMMARY_INTERVAL>0)) && echo "每 ${SUMMARY_INTERVAL}s" || echo "关闭" )"
   read -rp "输入 N（秒）：N>0 开启/修改；0 关闭；直接回车取消: " n || true
   [[ -z "${n// /}" ]] && { echo "未更改。"; return; }
-  if [[ "$n" =~ ^[0-9]+$ ]]; then
-    SUMMARY_INTERVAL="$n"
-    if (( SUMMARY_INTERVAL == 0 )); then
-      stop_summary; echo "${C_GREEN}[+] 已关闭定时汇总。${C_RESET}"
-    else
-      echo "${C_GREEN}[+] 设置为每 ${SUMMARY_INTERVAL}s 汇总一次。${C_RESET}"
-      is_summary_running && stop_summary
-      is_running && start_summary
-    fi
-  else
-    echo "${C_YELLOW}[-] 输入无效，未更改。${C_RESET}"
-  fi
+  if [[ "$n" =~ ^[0-9]+$ ]]; then SUMMARY_INTERVAL="$n"; is_summary_running && stop_summary; is_running && start_summary; (( SUMMARY_INTERVAL==0 )) && echo "${C_GREEN}[+] 已关闭定时汇总。${C_RESET}" || echo "${C_GREEN}[+] 设置为每 ${SUMMARY_INTERVAL}s 汇总一次。${C_RESET}"
+  else echo "${C_YELLOW}[-] 输入无效，未更改。${C_RESET}"; fi
 }
 
-#############################
-# 限速设置（仅脚本进程）
-#############################
 configure_limits() {
   echo "${C_BOLD}当前限速（总速，MB/s）：DL=${DL_LIMIT_MB}，UL=${UL_LIMIT_MB}${C_RESET}"
-  echo "  1) 限制上传速度（多少 M，总速，自动均分到线程）"
-  echo "  2) 限制下载速度（多少 M，总速，自动均分到线程）"
-  echo "  3) 同时限速（上下行都设为同样的 M）"
-  echo "  4) 清除全部限速"
+  echo "  1) 限制上传速度   2) 限制下载速度   3) 同时限速   4) 清除限速"
   read -rp "选择 [1-4]: " sub || true
   case "${sub:-}" in
-    1) read -rp "输入上传总速（MB/s，0 取消限速）: " v || true
-       [[ -z "${v// /}" ]] && { echo "未更改。"; return; }
-       if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then UL_LIMIT_MB="$v"; echo "${C_GREEN}[+] 已设置上传总速为 ${UL_LIMIT_MB} MB/s。${C_RESET}"
-       else echo "${C_YELLOW}[-] 输入无效。${C_RESET}"; fi ;;
-    2) read -rp "输入下载总速（MB/s，0 取消限速）: " v || true
-       [[ -z "${v// /}" ]] && { echo "未更改。"; return; }
-       if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then DL_LIMIT_MB="$v"; echo "${C_GREEN}[+] 已设置下载总速为 ${DL_LIMIT_MB} MB/s。${C_RESET}"
-       else echo "${C_YELLOW}[-] 输入无效。${C_RESET}"; fi ;;
-    3) read -rp "输入上下行总速（MB/s，0 取消限速）: " v || true
-       [[ -z "${v// /}" ]] && { echo "未更改。"; return; }
-       if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then DL_LIMIT_MB="$v"; UL_LIMIT_MB="$v"; echo "${C_GREEN}[+] 已将上下行总速都设为 ${v} MB/s。${C_RESET}"
-       else echo "${C_YELLOW}[-] 输入无效。${C_RESET}"; fi ;;
-    4) DL_LIMIT_MB=0; UL_LIMIT_MB=0; echo "${C_GREEN}[+] 已清除全部限速。${C_RESET}";;
+    1) read -rp "输入上传总速（MB/s，0 取消）: " v || true; [[ -n "${v// /}" && "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] && UL_LIMIT_MB="$v" || echo "未更改。";;
+    2) read -rp "输入下载总速（MB/s，0 取消）: " v || true; [[ -n "${v// /}" && "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] && DL_LIMIT_MB="$v" || echo "未更改。";;
+    3) read -rp "输入上下行总速（MB/s，0 取消）: " v || true; [[ -n "${v// /}" && "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] && DL_LIMIT_MB="$v" UL_LIMIT_MB="$v" || echo "未更改。";;
+    4) DL_LIMIT_MB=0; UL_LIMIT_MB=0;;
     *) echo "${C_YELLOW}无效选择。${C_RESET}";;
   esac
-
-  if (( DL_LIMIT_MB > 0 )) && (( DL_THREADS > 0 )); then
-    local per=$(awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
-    echo "  下载每线程≈ ${per} MB/s（curl --limit-rate）"
-  fi
-  if (( UL_LIMIT_MB > 0 )) && (( UL_THREADS > 0 )); then
-    local per=$(awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
-    echo "  上传每线程≈ ${per} MB/s（curl --limit-rate）"
-  fi
-
-  echo "${C_DIM}（说明：限速仅作用于本脚本启动的 curl 进程，不影响系统其他进程或网卡全局配置）${C_RESET}"
 }
 
-#############################
-# Trap / 菜单
-#############################
 trap 'echo; echo "${C_YELLOW}[!] 捕获到信号，正在清理…${C_RESET}"; stop_consumption; exit 0' INT TERM
 
 menu() {
@@ -609,4 +531,48 @@ menu() {
   done
 }
 
-menu
+# ======== 非交互 / systemd 自动模式 ========
+auto_start_daemon() {
+  local _mode="${AUTO_MODE:-b}"            # d/u/b 或 1/2/3
+  local _threads="${AUTO_THREADS:-}"       # 留空=自动
+  local _dl_pick="${AUTO_DL_PICK:-}"       # 下载编号，逗号分隔；留空=全量随机
+  local _ul_pick="${AUTO_UL_PICK:-}"       # 上传编号，逗号分隔；留空=仅 CF __up
+  local _hours="${AUTO_HOURS:-}"           # 留空=一直
+
+  local total_threads
+  if [[ -z "${_threads// /}" ]]; then total_threads=$(auto_threads)
+  elif [[ "$_threads" =~ ^[0-9]+$ ]] && (( _threads>0 )); then total_threads="$_threads"
+  else total_threads=$(auto_threads); fi
+
+  case "$_mode" in d|u|b) MODE="$_mode";; 1) MODE="d";; 2) MODE="u";; 3) MODE="b";; *) MODE="b";; esac
+
+  if [[ "$MODE" != "u" ]]; then parse_choice_to_array "${_dl_pick:-}" URLS ACTIVE_URLS; else ACTIVE_URLS=(); fi
+  if [[ "$MODE" != "d" ]]; then
+    if [[ -z "${_ul_pick// /}" ]]; then ACTIVE_UPLOAD_URLS=( "${UPLOAD_URLS[0]}" ); echo "[*] 默认仅使用 ${UPLOAD_URLS[0]}"
+    else parse_choice_to_array "${_ul_pick:-}" UPLOAD_URLS ACTIVE_UPLOAD_URLS; fi
+  else ACTIVE_UPLOAD_URLS=(); fi
+
+  if [[ -z "${_hours// /}" ]]; then END_TS=0
+  elif [[ "$_hours" =~ ^[0-9]+([.][0-9]+)?$ ]]; then local _secs; _secs=$(awk -v h="$_hours" 'BEGIN{printf "%.0f", h*3600}'); END_TS=$(( $(date +%s) + _secs ))
+  else END_TS=0; fi
+
+  if [[ "$MODE" == "b" ]]; then smart_split_threads "$total_threads"
+  elif [[ "$MODE" == "d" ]]; then DL_THREADS="$total_threads"; UL_THREADS=0
+  else DL_THREADS=0; UL_THREADS="$total_threads"; fi
+
+  start_consumption "$MODE" "$DL_THREADS" "$UL_THREADS"
+
+  if (( END_TS > 0 )); then
+    while (( $(date +%s) < END_TS )); do sleep 5; done
+    stop_consumption; exit 0
+  else
+    while true; do sleep 86400; done
+  fi
+}
+
+# 入口：AUTO_START=1 → 非交互守护；否则进入菜单
+if [[ "${AUTO_START:-0}" == "1" ]]; then
+  auto_start_daemon
+else
+  menu
+fi
