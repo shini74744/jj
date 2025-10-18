@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 流量消耗/测速脚本（数字模式 + 彩色菜单 + 实时统计 + 定时汇总 + 仅脚本限速）
+# 流量消耗/测速脚本（数字模式 + 彩色菜单 + 实时统计 + 定时汇总 + 仅脚本限速 + 强力清理）
 # 菜单：
 #  1) 开始消耗（交互式：上传/下载/同时、线程、地址、时长）
 #  2) 停止全部线程（打印最终汇总）
@@ -8,12 +8,13 @@
 #  5) 限速设置（仅对脚本生效）
 #  0) 退出
 #
-# 亮点：
-#  - 模式：1=下载、2=上传、3=同时（默认=3）
-#  - 下载/上传都用 curl，强制 IPv4（可配）、HTTP/1.1（可配）
-#  - 固定分块消耗（默认每次 50MB），更容易得到稳定的“本次/累计/总计”
-#  - 限速仅作用于脚本内的 curl 进程（--limit-rate），不影响整个 VPS
-#  - 上传改为 HTTP POST 直传（Cloudflare __up 等），不再使用 iperf3
+# 特性要点：
+#  - 模式数字选择：1=下载、2=上传、3=同时；默认=3
+#  - 下载：强制 IPv4（可配）、HTTP/1.1（可配），固定分块 Range 方式消耗（默认每次 CHUNK_MB=50MB）
+#  - 上传：使用 curl 直传 HTTP POST（不再使用 iperf3），同样按固定分块并支持限速
+#  - 限速仅作用于脚本内的 curl 进程（--limit-rate），不影响系统其他进程
+#  - 实时打印：每次任务显示 本次/线程累计/全局累计（MB），可选每 N 秒汇总总计
+#  - 启动后可等待首条线程输出再回菜单；Ctrl+C 强力清理进程树，避免残留
 
 set -Eeuo pipefail
 
@@ -28,6 +29,10 @@ IP_VERSION=${IP_VERSION:-4}     # 4=仅IPv4, 6=仅IPv6, 0=自动
 FORCE_HTTP1=${FORCE_HTTP1:-1}   # 1=强制 HTTP/1.1（部分站点 h2 不稳时建议开）
 ALWAYS_CHUNK=${ALWAYS_CHUNK:-1} # 1=总是按固定分块；0=先整段→失败再兜底分块
 CHUNK_MB=${CHUNK_MB:-50}        # 分块大小（MB），建议 25~200
+
+# 启动后是否等到第一条线程输出再回到菜单
+START_WAIT_FIRST_OUTPUT=${START_WAIT_FIRST_OUTPUT:-1}  # 1=开启, 0=关闭
+START_WAIT_SPINS=${START_WAIT_SPINS:-30}               # 最多等待次数；0.1s/次 → 30 ≈ 3秒
 
 # 颜色/样式
 init_colors() {
@@ -54,7 +59,7 @@ esac
 #############################
 # 目标地址池（可增减）
 #############################
-# 下载地址池（已加入你要求的两个地址）
+# 下载地址池（含你新增的 Apple 视频分片 & Cloudflare down）
 URLS=(
   "https://speed.hetzner.de/1GB.bin"
   "https://speed.hetzner.de/10GB.bin"
@@ -74,7 +79,7 @@ URLS=(
   "https://speed.cloudflare.com/__down?bytes=104857600"
 )
 
-# 上传地址池（改为 HTTP 直传，不用 iperf3）
+# 上传地址池（使用 HTTP 直传，不用 iperf3）
 UPLOAD_URLS=(
   "https://speed.cloudflare.com/__up"
   "https://httpbin.org/post"
@@ -198,11 +203,15 @@ bytes_to_mb() { awk -v b="$1" 'BEGIN{printf "%.2f", b/1048576}'; }
 print_dl_status() {
   local tid="$1" url="$2" bytes="$3" tsum="$4"
   local global_bytes; global_bytes=$(atomic_add "$DL_TOTAL_FILE" "$bytes")
+  # 标记“已有输出”
+  [[ -n "$COUNTER_DIR" && ! -f "$COUNTER_DIR/first.tick" ]] && : > "$COUNTER_DIR/first.tick"
   echo "${C_CYAN}[DL#${tid}]${C_RESET} 目标: ${C_BLUE}${url}${C_RESET} | 本次: ${C_YELLOW}$(bytes_to_mb "$bytes") MB${C_RESET} | 线程累计: ${C_GREEN}$(bytes_to_mb "$tsum") MB${C_RESET} | 下载总计: ${C_BOLD}$(bytes_to_mb "$global_bytes") MB${C_RESET}"
 }
 print_ul_status() {
   local tid="$1" url="$2" bytes="$3" tsum="$4"
   local global_bytes; global_bytes=$(atomic_add "$UL_TOTAL_FILE" "$bytes")
+  # 标记“已有输出”
+  [[ -n "$COUNTER_DIR" && ! -f "$COUNTER_DIR/first.tick" ]] && : > "$COUNTER_DIR/first.tick"
   echo "${C_MAGENTA}[UL#${tid}]${C_RESET} 目标: ${C_BLUE}${url}${C_RESET} | 本次: ${C_YELLOW}$(bytes_to_mb "$bytes") MB${C_RESET} | 线程累计: ${C_GREEN}$(bytes_to_mb "$tsum") MB${C_RESET} | 上传总计: ${C_BOLD}$(bytes_to_mb "$global_bytes") MB${C_RESET}"
 }
 
@@ -227,7 +236,7 @@ calc_ul_thread_bps() {
 #############################
 curl_measure_dl_range() {
   # 按 Range 拉一段，返回 size_download
-  # $1: URL   $2: range_end(byte, e.g. 52428799)   $3: 限速B/s
+  # $1: URL   $2: range_end(byte)   $3: 限速B/s
   local url="$1" range_end="$2" limit_bps="${3:-0}"
   local extra=(); (( limit_bps > 0 )) && extra+=(--limit-rate "$limit_bps")
   curl -sS -L \
@@ -327,7 +336,7 @@ upload_worker() {
     if [[ -n "$res" ]]; then
       bytes="${res%% *}"; code="${res##* }"
     fi
-    # 仅统计成功上传的字节；常见 200/204 视为成功
+    # 仅统计成功上传的字节
     if [[ "$code" != "200" && "$code" != "204" && "$code" != "201" && "$code" != "202" ]]; then
       bytes=0
       sleep 1
@@ -367,12 +376,34 @@ stop_summary() {
 }
 
 #############################
+# 清理辅助（强力）
+#############################
+kill_tree_once() {
+  # $1: 信号（INT/TERM/KILL）
+  local sig="$1"
+  if [[ ${#PIDS[@]} -gt 0 ]]; then
+    for pid in "${PIDS[@]}"; do
+      pkill -"${sig}" -P "$pid" 2>/dev/null || true
+      kill  -"${sig}"    "$pid" 2>/dev/null || true
+    done
+  fi
+}
+
+#############################
 # 启停控制
 #############################
 init_and_check() {
   check_curl || return 1
   init_counters
   return 0
+}
+
+wait_first_output() {
+  (( START_WAIT_FIRST_OUTPUT )) || return 0
+  for ((i=0; i<START_WAIT_SPINS; i++)); do
+    [[ -f "$COUNTER_DIR/first.tick" ]] && return 0
+    sleep 0.1
+  done
 }
 
 start_consumption() {
@@ -396,20 +427,44 @@ start_consumption() {
 
   start_summary
   echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 或选菜单 2 可停止。${C_RESET}"
+
+  # 等到有第一条线程输出再返回菜单（最多几秒）
+  wait_first_output
 }
 
 stop_consumption() {
-  if ! is_running; then echo "${C_YELLOW}[*] 当前没有运行中的线程。${C_RESET}"
+  if ! is_running; then
+    echo "${C_YELLOW}[*] 当前没有运行中的线程。${C_RESET}"
   else
     echo "${C_BOLD}[*] $(human_now) 正在停止全部线程…${C_RESET}"
-    kill -INT "${PIDS[@]}" 2>/dev/null || true; sleep 1
-    kill -TERM "${PIDS[@]}" 2>/dev/null || true; sleep 1
-    kill -KILL "${PIDS[@]}" 2>/dev/null || true; PIDS=()
+
+    # 先优雅中断，再强制
+    kill_tree_once INT
+    sleep 0.5
+    kill_tree_once TERM
+    sleep 0.5
+    kill_tree_once KILL
+
+    # 等待全部退出，避免僵尸进程
+    for pid in "${PIDS[@]}"; do
+      wait "$pid" 2>/dev/null || true
+      pkill -KILL -P "$pid" 2>/dev/null || true
+    done
+    PIDS=()
   fi
+
+  # 停止定时汇总
   stop_summary
-  local dl_g=0 ul_g=0; [[ -f "$DL_TOTAL_FILE" ]] && dl_g=$(cat "$DL_TOTAL_FILE"); [[ -f "$UL_TOTAL_FILE" ]] && ul_g=$(cat "$UL_TOTAL_FILE")
+
+  # 打印最终汇总
+  local dl_g=0 ul_g=0
+  [[ -f "$DL_TOTAL_FILE" ]] && dl_g=$(cat "$DL_TOTAL_FILE")
+  [[ -f "$UL_TOTAL_FILE" ]] && ul_g=$(cat "$UL_TOTAL_FILE")
   echo "${C_BOLD}[*] 最终汇总：下载总计 ${C_CYAN}$(bytes_to_mb "$dl_g") MB${C_RESET}${C_BOLD}；上传总计 ${C_MAGENTA}$(bytes_to_mb "$ul_g") MB${C_RESET}"
-  cleanup_counters; echo "${C_GREEN}[+] 已全部停止。${C_RESET}"
+
+  # 清理计数文件
+  cleanup_counters
+  echo "${C_GREEN}[+] 已全部停止。${C_RESET}"
 }
 
 #############################
