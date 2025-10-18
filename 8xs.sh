@@ -8,27 +8,27 @@
 #  5) 限速设置（仅对脚本生效）
 #  0) 退出
 #
-# 特性要点：
-#  - 模式数字选择：1=下载、2=上传、3=同时；默认=3
-#  - 下载：强制 IPv4（可配）、HTTP/1.1（可配），固定分块 Range 方式消耗（默认每次 CHUNK_MB=50MB）
-#  - 上传：使用 curl 直传 HTTP POST（不再使用 iperf3），同样按固定分块并支持限速
-#  - 限速仅作用于脚本内的 curl 进程（--limit-rate），不影响系统其他进程
-#  - 实时打印：每次任务显示 本次/线程累计/全局累计（MB），可选每 N 秒汇总总计
-#  - 启动后可等待首条线程输出再回菜单；Ctrl+C 强力清理进程树，避免残留
+# 变更点：
+#  - 【B】分块分离：下载/上传块大小分别配置（CHUNK_MB_DL、CHUNK_MB_UL）
+#  - 【D】默认仅 Cloudflare 上行：上传地址不选编号时，仅使用 https://speed.cloudflare.com/__up
+#  - 其他：默认=3 同时、IPv4/HTTP1、固定分块、仅脚本限速、定时汇总、等待首条输出、Ctrl+C 强清理
 
 set -Eeuo pipefail
 
 #############################
 # 可自定义默认值 / 首选项
 #############################
-DEFAULT_THREADS=${DEFAULT_THREADS:-6}     # 留空时的兜底值（实际会按 CPU 自动估算）
+DEFAULT_THREADS=${DEFAULT_THREADS:-6}     # 留空兜底，实际会按 CPU 自动估算
 SUMMARY_INTERVAL=${SUMMARY_INTERVAL:-0}   # 定时汇总秒数；0=关闭
 
 # 连通性与下载/上传行为（可用环境变量覆盖）
 IP_VERSION=${IP_VERSION:-4}     # 4=仅IPv4, 6=仅IPv6, 0=自动
 FORCE_HTTP1=${FORCE_HTTP1:-1}   # 1=强制 HTTP/1.1（部分站点 h2 不稳时建议开）
 ALWAYS_CHUNK=${ALWAYS_CHUNK:-1} # 1=总是按固定分块；0=先整段→失败再兜底分块
-CHUNK_MB=${CHUNK_MB:-50}        # 分块大小（MB），建议 25~200
+
+# 【B】分块分离（MB）
+CHUNK_MB_DL=${CHUNK_MB_DL:-50}  # 下载每块大小（MB）
+CHUNK_MB_UL=${CHUNK_MB_UL:-10}  # 上传每块大小（MB）——更小以提升上传打印频率
 
 # 启动后是否等到第一条线程输出再回到菜单
 START_WAIT_FIRST_OUTPUT=${START_WAIT_FIRST_OUTPUT:-1}  # 1=开启, 0=关闭
@@ -59,7 +59,7 @@ esac
 #############################
 # 目标地址池（可增减）
 #############################
-# 下载地址池（含你新增的 Apple 视频分片 & Cloudflare down）
+# 下载地址池（含 Apple 分片 & Cloudflare down）
 URLS=(
   "https://speed.hetzner.de/1GB.bin"
   "https://speed.hetzner.de/10GB.bin"
@@ -79,7 +79,7 @@ URLS=(
   "https://speed.cloudflare.com/__down?bytes=104857600"
 )
 
-# 上传地址池（使用 HTTP 直传，不用 iperf3）
+# 上传地址池（HTTP 直传；【D】默认仅 CF 上行）
 UPLOAD_URLS=(
   "https://speed.cloudflare.com/__up"
   "https://httpbin.org/post"
@@ -114,7 +114,7 @@ auto_threads() {
   local cores=1
   if command -v nproc >/dev/null 2>&1; then cores=$(nproc)
   elif [[ -r /proc/cpuinfo ]]; then cores=$(grep -c '^processor' /proc/cpuinfo || echo 1); fi
-  local t=$(( cores*2 )); (( t<4 )) && t=4; (( t>32 )) && t=32; echo "$t"
+  local t=$(( cores * 2 )); (( t < 4 )) && t=4; (( t > 32 )) && t=32; echo "$t"
 }
 
 check_curl() {
@@ -124,7 +124,7 @@ check_curl() {
   fi
 }
 
-is_running() { [[ ${#PIDS[@]} -gt 0 ]]; }
+is_running() { [[ ${#PIDS[@]} -gt 0 ]] ; }
 is_summary_running() { [[ -n "${SUMMARY_PID:-}" ]] && kill -0 "$SUMMARY_PID" 2>/dev/null; }
 
 show_urls() {
@@ -203,14 +203,12 @@ bytes_to_mb() { awk -v b="$1" 'BEGIN{printf "%.2f", b/1048576}'; }
 print_dl_status() {
   local tid="$1" url="$2" bytes="$3" tsum="$4"
   local global_bytes; global_bytes=$(atomic_add "$DL_TOTAL_FILE" "$bytes")
-  # 标记“已有输出”
   [[ -n "$COUNTER_DIR" && ! -f "$COUNTER_DIR/first.tick" ]] && : > "$COUNTER_DIR/first.tick"
   echo "${C_CYAN}[DL#${tid}]${C_RESET} 目标: ${C_BLUE}${url}${C_RESET} | 本次: ${C_YELLOW}$(bytes_to_mb "$bytes") MB${C_RESET} | 线程累计: ${C_GREEN}$(bytes_to_mb "$tsum") MB${C_RESET} | 下载总计: ${C_BOLD}$(bytes_to_mb "$global_bytes") MB${C_RESET}"
 }
 print_ul_status() {
   local tid="$1" url="$2" bytes="$3" tsum="$4"
   local global_bytes; global_bytes=$(atomic_add "$UL_TOTAL_FILE" "$bytes")
-  # 标记“已有输出”
   [[ -n "$COUNTER_DIR" && ! -f "$COUNTER_DIR/first.tick" ]] && : > "$COUNTER_DIR/first.tick"
   echo "${C_MAGENTA}[UL#${tid}]${C_RESET} 目标: ${C_BLUE}${url}${C_RESET} | 本次: ${C_YELLOW}$(bytes_to_mb "$bytes") MB${C_RESET} | 线程累计: ${C_GREEN}$(bytes_to_mb "$tsum") MB${C_RESET} | 上传总计: ${C_BOLD}$(bytes_to_mb "$global_bytes") MB${C_RESET}"
 }
@@ -218,13 +216,11 @@ print_ul_status() {
 #############################
 # 限速计算（自动均分到线程）
 #############################
-# 下载：返回每线程 B/s（curl --limit-rate）
 calc_dl_thread_bps() {
   if (( DL_LIMIT_MB > 0 )) && (( DL_THREADS > 0 )); then
     awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{v=mb*1048576/n; if(v<1) v=1; printf "%.0f", v}'
   else echo 0; fi
 }
-# 上传：返回每线程 B/s（curl --limit-rate）
 calc_ul_thread_bps() {
   if (( UL_LIMIT_MB > 0 )) && (( UL_THREADS > 0 )); then
     awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{v=mb*1048576/n; if(v<1) v=1; printf "%.0f", v}'
@@ -236,7 +232,6 @@ calc_ul_thread_bps() {
 #############################
 curl_measure_dl_range() {
   # 按 Range 拉一段，返回 size_download
-  # $1: URL   $2: range_end(byte)   $3: 限速B/s
   local url="$1" range_end="$2" limit_bps="${3:-0}"
   local extra=(); (( limit_bps > 0 )) && extra+=(--limit-rate "$limit_bps")
   curl -sS -L \
@@ -252,7 +247,6 @@ curl_measure_dl_range() {
 
 curl_measure_full() {
   # 完整拉取，返回: "<bytes> <http_code> <url_effective>"
-  # $1: URL   $2: 限速B/s
   local url="$1" limit_bps="${2:-0}"
   local extra=(); (( limit_bps > 0 )) && extra+=(--limit-rate "$limit_bps")
   curl -sS -L \
@@ -267,7 +261,6 @@ curl_measure_full() {
 
 curl_measure_upload() {
   # 直传上传，返回: "<bytes> <http_code>"
-  # $1: URL   $2: BYTES   $3: 限速B/s
   local url="$1" bytes="$2" limit_bps="${3:-0}"
   local extra=(); (( limit_bps > 0 )) && extra+=(--limit-rate "$limit_bps")
   head -c "$bytes" /dev/zero | \
@@ -298,7 +291,7 @@ download_worker() {
     local bytes=0
 
     if (( ALWAYS_CHUNK )); then
-      local range_end=$(( CHUNK_MB*1048576 - 1 ))
+      local range_end=$(( CHUNK_MB_DL*1048576 - 1 ))
       local res2; res2=$(curl_measure_dl_range "$final" "$range_end" "$limit_bps")
       [[ -n "$res2" && "$res2" =~ ^[0-9]+$ ]] && bytes="$res2" || bytes=0
     else
@@ -308,7 +301,7 @@ download_worker() {
         bytes="${res%% *}"; res="${res#* }"; code="${res%% *}"; eff="${res#* }"
       fi
       if [[ -z "$bytes" || "$bytes" == "0" || ( "$code" != "200" && "$code" != "206" ) ]]; then
-        local range_end=$(( CHUNK_MB*1048576 - 1 ))
+        local range_end=$(( CHUNK_MB_DL*1048576 - 1 ))
         local res2; res2=$(curl_measure_dl_range "$final" "$range_end" "$limit_bps")
         [[ -n "$res2" && "$res2" =~ ^[0-9]+$ ]] && bytes="$res2" || bytes=0
       fi
@@ -327,7 +320,7 @@ upload_worker() {
     local url="${ACTIVE_UPLOAD_URLS[RANDOM % ${#ACTIVE_UPLOAD_URLS[@]}]}"
     local final="${url}?nocache=$(date +%s%N)-$id-$RANDOM"
     local limit_bps; limit_bps=$(calc_ul_thread_bps)
-    local chunk_bytes=$(( CHUNK_MB*1048576 ))
+    local chunk_bytes=$(( CHUNK_MB_UL*1048576 ))
 
     local res; res="$(curl_measure_upload "$final" "$chunk_bytes" "$limit_bps")"
     local bytes=0 code="000"
@@ -450,10 +443,8 @@ stop_consumption() {
     PIDS=()
   fi
 
-  # 停止定时汇总
   stop_summary
 
-  # 打印最终汇总
   local dl_g=0 ul_g=0
   [[ -f "$DL_TOTAL_FILE" ]] && dl_g=$(cat "$DL_TOTAL_FILE")
   [[ -f "$UL_TOTAL_FILE" ]] && ul_g=$(cat "$UL_TOTAL_FILE")
@@ -495,7 +486,7 @@ interactive_start() {
   elif [[ "$t" =~ ^[0-9]+$ ]] && (( t > 0 )); then total_threads="$t"
   else echo "${C_YELLOW}[!] 非法输入，使用自动选择。${C_RESET}"; total_threads=$(auto_threads); fi
 
-  # ★★★ 改为：先显示要选的那个列表，再立刻询问该列表编号 ★★★
+  # 下载选择
   if [[ "$MODE" != "u" ]]; then
     list_download_urls
     read -rp "下载地址编号（逗号分隔，留空=全量随机）: " pick_dl || true
@@ -504,10 +495,16 @@ interactive_start() {
     ACTIVE_URLS=()
   fi
 
+  # 上传选择 ——【D】留空=默认仅 Cloudflare
   if [[ "$MODE" != "d" ]]; then
     list_upload_urls
-    read -rp "上传地址编号（逗号分隔，留空=全量随机）: " pick_ul || true
-    parse_choice_to_array "${pick_ul:-}" UPLOAD_URLS ACTIVE_UPLOAD_URLS
+    read -rp "上传地址编号（逗号分隔，留空=默认仅 Cloudflare）: " pick_ul || true
+    if [[ -z "${pick_ul// /}" ]]; then
+      ACTIVE_UPLOAD_URLS=( "${UPLOAD_URLS[0]}" )  # 只用 CF
+      echo "[*] 未选择编号：默认仅使用 ${UPLOAD_URLS[0]}"
+    else
+      parse_choice_to_array "${pick_ul:-}" UPLOAD_URLS ACTIVE_UPLOAD_URLS
+    fi
   else
     ACTIVE_UPLOAD_URLS=()
   fi
@@ -522,6 +519,7 @@ interactive_start() {
     echo "${C_YELLOW}[!] 非法输入，改为一直运行。${C_RESET}"; END_TS=0
   fi
 
+  # 线程分配（同时模式默认 1:1；如需偏向上传可自行修改）
   if [[ "$MODE" == "b" ]]; then
     DL_THREADS=$(( total_threads / 2 ))
     UL_THREADS=$(( total_threads - DL_THREADS ))
