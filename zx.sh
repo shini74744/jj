@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 流量消耗/测速脚本（数字模式 + 彩色菜单 + 实时统计 + 定时汇总 + 仅脚本限速 + 强力清理）
 # 变更：分块分离(CHUNK_MB_DL/UL)、默认仅CF上行(留空时)、智能分配线程（偶数均分/奇数自动偏向更受限的一方或默认给上传）
-
+# 新增：菜单 2「限制模式（CPU）」：1) 恒定 50%  2) 5min@90% / 10min@50%  3) 清除；
+#       设置后对「开始消耗」（菜单 1）自动生效；运行时切换也会即时生效。
 set -Eeuo pipefail
 
 #############################
@@ -92,6 +93,13 @@ UL_TOTAL_FILE=""
 DL_LIMIT_MB=0
 UL_LIMIT_MB=0
 
+## ===== CPU 限制相关（新增） =====
+LIMIT_MODE=0              # 0=无, 1=恒定50%, 2=5min@90%/10min@50%
+LIMIT_METHOD=""           # "cgroup" | "cpulimit" | "none"
+CGROUP_DIR=""             # cgroup v2 路径
+LIMITER_PID=              # 周期限速调度器 PID（mode=2）
+CPULIMIT_WATCHERS=()      # cpulimit 进程 PID 数组
+
 #############################
 # 工具函数
 #############################
@@ -144,6 +152,20 @@ show_status() {
   printf "  汇总: %s   结束: %s\n" \
     "$( ((SUMMARY_INTERVAL>0)) && echo "每 ${SUMMARY_INTERVAL}s" || echo "关闭")" \
     "$( ((END_TS>0)) && date -d @"$END_TS" "+%F %T" || echo "手动停止")"
+  printf "  限制模式: %s（方法: %s）\n" \
+    "$(
+       case "$LIMIT_MODE" in
+         0) echo "关闭" ;;
+         1) echo "恒定 50%" ;;
+         2) echo "5min@90% / 10min@50%" ;;
+       esac
+     )" \
+    "$(
+       case "$LIMIT_METHOD" in
+         "") echo "-" ;;
+         *)  echo "$LIMIT_METHOD" ;;
+       esac
+     )"
   echo "${C_BOLD}└────────────────────────────────────────────────────────┘${C_RESET}"
 }
 
@@ -359,6 +381,125 @@ kill_tree_once() {
 }
 
 #############################
+# CPU 限制实现（新增）
+#############################
+cores_count() {
+  if command -v nproc >/dev/null 2>&1; then nproc; else echo 1; fi
+}
+detect_limit_method() {
+  if [[ -z "$LIMIT_METHOD" ]]; then
+    if [[ -f /sys/fs/cgroup/cgroup.controllers ]] && grep -qw cpu /sys/fs/cgroup/cgroup.controllers && [[ -w /sys/fs/cgroup ]]; then
+      LIMIT_METHOD="cgroup"
+    elif command -v cpulimit >/dev/null 2>&1; then
+      LIMIT_METHOD="cpulimit"
+    else
+      LIMIT_METHOD="none"
+    fi
+  fi
+}
+is_scheduler_running() { [[ -n "${LIMITER_PID:-}" ]] && kill -0 "$LIMITER_PID" 2>/dev/null; }
+kill_scheduler() { is_scheduler_running && { kill -TERM "$LIMITER_PID" 2>/dev/null || true; wait "$LIMITER_PID" 2>/dev/null || true; LIMITER_PID=; }; }
+kill_cpulimit_watchers() {
+  if ((${#CPULIMIT_WATCHERS[@]})); then
+    for wp in "${CPULIMIT_WATCHERS[@]}"; do kill -TERM "$wp" 2>/dev/null || true; done
+    CPULIMIT_WATCHERS=()
+  fi
+}
+# cgroup 路径准备 & 进入本脚本进程（子进程会继承）
+cgroup_enter_self() {
+  [[ "$LIMIT_METHOD" != "cgroup" ]] && return 0
+  if [[ -z "$CGROUP_DIR" ]]; then
+    CGROUP_DIR="/sys/fs/cgroup/vpsburn.$$"
+    mkdir -p "$CGROUP_DIR" 2>/dev/null || true
+  fi
+  [[ -w "$CGROUP_DIR/cgroup.procs" ]] && echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
+}
+# 按总 CPU 百分比设置限额（多核按总和计算）
+cgroup_set_percent() {
+  local pct="$1"
+  [[ "$LIMIT_METHOD" != "cgroup" ]] && return 0
+  [[ -z "$CGROUP_DIR" ]] && return 0
+  local period=100000
+  if (( pct <= 0 || pct >= 100 )); then
+    echo "max $period" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
+    return 0
+  fi
+  local n; n=$(cores_count)
+  local quota; quota=$(awk -v P="$period" -v N="$n" -v R="$pct" 'BEGIN{printf "%.0f", P*N*R/100}')
+  echo "$quota $period" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
+}
+cgroup_clear() {
+  [[ "$LIMIT_METHOD" != "cgroup" ]] && return 0
+  cgroup_set_percent 100
+}
+# cpulimit 附着到当前工作线程
+cpulimit_apply_for_pids() {
+  local pct="$1"
+  kill_cpulimit_watchers
+  if ! command -v cpulimit >/dev/null 2>&1; then return 0; fi
+  if ((${#PIDS[@]}==0)); then return 0; fi
+  for pid in "${PIDS[@]}"; do
+    cpulimit -p "$pid" -l "$pct" -b >/dev/null 2>&1 &
+    CPULIMIT_WATCHERS+=("$!")
+  done
+}
+# 统一入口：设置瞬时限额
+limit_apply_percent() {
+  local pct="$1"
+  detect_limit_method
+  case "$LIMIT_METHOD" in
+    cgroup)   cgroup_set_percent "$pct" ;;
+    cpulimit) cpulimit_apply_for_pids "$pct" ;;
+    *) echo "${C_YELLOW}[!] 本机无 cgroup v2 写权限也未安装 cpulimit，无法精确限速。${C_RESET}" ;;
+  esac
+}
+# 周期限速调度器（5min@90% → 10min@50%）
+limit_scheduler() {
+  while true; do
+    limit_apply_percent 90; sleep 300
+    limit_apply_percent 50; sleep 600
+  done
+}
+start_limit_scheduler() { is_scheduler_running || { limit_scheduler & LIMITER_PID=$!; echo "${C_GREEN}[*] 周期限速已启用：5min@90% / 10min@50%。${C_RESET}"; }; }
+stop_limit_scheduler() { kill_scheduler; }
+# 模式切换
+limit_set_mode() {
+  local mode="$1"
+  detect_limit_method
+  case "$mode" in
+    0)
+      LIMIT_MODE=0
+      stop_limit_scheduler
+      limit_apply_percent 100
+      echo "${C_GREEN}[+] 已清除 CPU 限制。${C_RESET}"
+      ;;
+    1)
+      LIMIT_MODE=1
+      stop_limit_scheduler
+      [[ "$LIMIT_METHOD" == "cgroup" ]] && cgroup_enter_self
+      limit_apply_percent 50
+      echo "${C_GREEN}[+] 已设置恒定 50% CPU 限制。${C_RESET}"
+      ;;
+    2)
+      LIMIT_MODE=2
+      [[ "$LIMIT_METHOD" == "cgroup" ]] && cgroup_enter_self
+      start_limit_scheduler
+      ;;
+  esac
+}
+ensure_limit_on_current_run() {
+  (( LIMIT_MODE==0 )) && return 0
+  detect_limit_method
+  if [[ "$LIMIT_METHOD" == "cgroup" ]]; then
+    if (( LIMIT_MODE==1 )); then limit_apply_percent 50; fi
+    if (( LIMIT_MODE==2 )); then start_limit_scheduler; fi
+  elif [[ "$LIMIT_METHOD" == "cpulimit" ]]; then
+    if (( LIMIT_MODE==1 )); then cpulimit_apply_for_pids 50; fi
+    if (( LIMIT_MODE==2 )); then start_limit_scheduler; fi
+  fi
+}
+
+#############################
 # 启停控制 & 智能分配
 #############################
 init_and_check() { check_curl || return 1; init_counters; }
@@ -379,7 +520,6 @@ smart_split_threads() {
     DL_THREADS=$(( total/2 )); UL_THREADS=$(( total/2 )); return
   fi
   # 奇数：优先依据限速判断“更受限的一方”，否则默认给上传
-  # 仅 DL 有限速 → 额外给 DL；仅 UL 有限速 → 额外给 UL；两者都有 → 给限速更小的一方
   extra_side="ul" # 默认给上传
   dl_pos=$(awk -v x="$DL_LIMIT_MB" 'BEGIN{print (x>0)?1:0}')
   ul_pos=$(awk -v x="$UL_LIMIT_MB" 'BEGIN{print (x>0)?1:0}')
@@ -389,7 +529,6 @@ smart_split_threads() {
     elif (( dl_pos==0 && ul_pos==1 )); then
       extra_side="ul"
     else
-      # 两者都有：比大小，值小=更受限
       cmp=$(awk -v dl="$DL_LIMIT_MB" -v ul="$UL_LIMIT_MB" 'BEGIN{if(dl<ul) print "dl"; else print "ul"}')
       extra_side="$cmp"
     fi
@@ -411,6 +550,12 @@ start_consumption() {
   echo "[*] 定时汇总：$( ((SUMMARY_INTERVAL>0)) && echo "每 ${SUMMARY_INTERVAL}s" || echo "关闭" )"
   (( END_TS > 0 )) && echo "[*] 预计结束于：$(date -d @"$END_TS" "+%F %T")"
 
+  # 若已配置 CPU 限制：在启动前准备好环境（cgroup 需先入组）
+  if (( LIMIT_MODE>0 )); then
+    detect_limit_method
+    [[ "$LIMIT_METHOD" == "cgroup" ]] && cgroup_enter_self
+  fi
+
   if [[ "$MODE" != "u" ]] && (( dl_n > 0 )); then
     for ((i=1; i<=dl_n; i++)); do download_worker "$i" & PIDS+=("$!"); sleep 0.05; done
   fi
@@ -419,8 +564,11 @@ start_consumption() {
   fi
 
   start_summary
-  echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 或选菜单 2 可停止。${C_RESET}"
+  echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 或选菜单 3 可停止。${C_RESET}"
   wait_first_output
+
+  # 子进程已就绪后，确保限速应用到当前运行（cpulimit 需要此步骤）
+  ensure_limit_on_current_run
 }
 
 stop_consumption() {
@@ -437,6 +585,8 @@ stop_consumption() {
     done
     PIDS=()
   fi
+  # 停掉 cpulimit watchers（周期调度器保留，以便后续启动仍自动生效）
+  kill_cpulimit_watchers
   stop_summary
   local dl_g=0 ul_g=0
   [[ -f "$DL_TOTAL_FILE" ]] && dl_g=$(cat "$DL_TOTAL_FILE")
@@ -579,6 +729,30 @@ configure_limits() {
 }
 
 #############################
+# 限制模式菜单（新增）
+#############################
+configure_cpu_limit_mode() {
+  echo "${C_BOLD}限制模式（CPU）：${C_RESET}当前 = $(
+    case "$LIMIT_MODE" in
+      0) echo "关闭" ;;
+      1) echo "恒定 50%" ;;
+      2) echo "周期 5min@90% / 10min@50%" ;;
+    esac
+  )"
+  echo "  1) 限制到 50% 以下（恒定）"
+  echo "  2) 5 分钟 90%，10 分钟 50%，循环"
+  echo "  3) 清除限制"
+  read -rp "选择 [1-3]: " lm || true
+  case "${lm:-}" in
+    1) limit_set_mode 1 ;;
+    2) limit_set_mode 2 ;;
+    3) limit_set_mode 0 ;;
+    *) echo "${C_YELLOW}无效选择，未更改。${C_RESET}" ;;
+  esac
+  echo "${C_DIM}说明：优先使用 cgroup v2（需可写 /sys/fs/cgroup），否则回退到 cpulimit。若均不可用，将仅提示无法精确限速。${C_RESET}"
+}
+
+#############################
 # Trap / 菜单
 #############################
 trap 'echo; echo "${C_YELLOW}[!] 捕获到信号，正在清理…${C_RESET}"; stop_consumption; exit 0' INT TERM
@@ -590,19 +764,21 @@ menu() {
     show_status
     echo "${C_BOLD}├──────────────────────────────── 菜 单 ─────────────────────────┤${C_RESET}"
     echo "  1) 开始消耗（交互式：上传/下载/同时、线程、地址、时长）"
-    echo "  2) 停止全部线程（显示最终汇总）"
-    echo "  3) 查看地址池（下载/上传）"
-    echo "  4) 设置/关闭定时汇总（每 N 秒）"
-    echo "  5) 限速设置（仅脚本生效）"
+    echo "  2) 限制模式（CPU：50% / 5min@90%→10min@50% / 清除）"
+    echo "  3) 停止全部线程（显示最终汇总）"
+    echo "  4) 查看地址池（下载/上传）"
+    echo "  5) 设置/关闭定时汇总（每 N 秒）"
+    echo "  6) 限速设置（仅脚本生效）"
     echo "  0) 退出"
     echo "${C_BOLD}└────────────────────────────────────────────────────────────────┘${C_RESET}"
-    read -rp "请选择 [0-5]: " c || true
+    read -rp "请选择 [0-6]: " c || true
     case "${c:-}" in
-      1) interactive_start ;;
-      2) stop_consumption   ;;
-      3) show_urls          ;;
-      4) configure_summary  ;;
-      5) configure_limits   ;;
+      1) interactive_start        ;;
+      2) configure_cpu_limit_mode ;;
+      3) stop_consumption         ;;
+      4) show_urls                ;;
+      5) configure_summary        ;;
+      6) configure_limits         ;;
       0) stop_consumption; echo "再见！"; exit 0 ;;
       *) echo "${C_YELLOW}无效选择。${C_RESET}" ;;
     esac
