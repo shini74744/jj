@@ -2,8 +2,10 @@
 # 流量消耗/测速脚本（数字模式 + 彩色菜单 + 实时统计 + 定时汇总 + 仅脚本限速 + 强力清理）
 # 变更：分块分离(CHUNK_MB_DL/UL)、默认仅CF上行(留空时)、智能分配线程（偶数均分/奇数自动偏向更受限的一方或默认给上传）
 # 新增：菜单 2「限制模式（CPU）」：1) 恒定 50%  2) 5min@90% / 10min@50%  3) 清除；
-#       设置后对「开始消耗」（菜单 1）自动生效；运行时切换也会即时生效。
-set -Eeuo pipefail
+#       在菜单 2 设置后，对菜单 1 的“开始消耗”自动生效；运行中切换也会即时生效。
+
+# 注意：移除了 -e（出错即退出），避免在 cgroup/cpulimit 不可用时直接退回 shell
+set -Euo pipefail
 
 #############################
 # 可自定义默认值 / 首选项
@@ -381,7 +383,7 @@ kill_tree_once() {
 }
 
 #############################
-# CPU 限制实现（新增）
+# CPU 限制实现（新增，带容错）
 #############################
 cores_count() {
   if command -v nproc >/dev/null 2>&1; then nproc; else echo 1; fi
@@ -407,30 +409,30 @@ kill_cpulimit_watchers() {
 }
 # cgroup 路径准备 & 进入本脚本进程（子进程会继承）
 cgroup_enter_self() {
-  [[ "$LIMIT_METHOD" != "cgroup" ]] && return 0
+  set +e
+  [[ "$LIMIT_METHOD" != "cgroup" ]] && { set -e; return 0; }
   if [[ -z "$CGROUP_DIR" ]]; then
     CGROUP_DIR="/sys/fs/cgroup/vpsburn.$$"
     mkdir -p "$CGROUP_DIR" 2>/dev/null || true
   fi
   [[ -w "$CGROUP_DIR/cgroup.procs" ]] && echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
+  set -e
 }
 # 按总 CPU 百分比设置限额（多核按总和计算）
 cgroup_set_percent() {
+  set +e
   local pct="$1"
-  [[ "$LIMIT_METHOD" != "cgroup" ]] && return 0
-  [[ -z "$CGROUP_DIR" ]] && return 0
+  [[ "$LIMIT_METHOD" != "cgroup" ]] && { set -e; return 0; }
+  [[ -z "$CGROUP_DIR" ]] && { set -e; return 0; }
   local period=100000
   if (( pct <= 0 || pct >= 100 )); then
-    echo "max $period" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
-    return 0
+    echo "max" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
+    set -e; return 0
   fi
   local n; n=$(cores_count)
   local quota; quota=$(awk -v P="$period" -v N="$n" -v R="$pct" 'BEGIN{printf "%.0f", P*N*R/100}')
   echo "$quota $period" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
-}
-cgroup_clear() {
-  [[ "$LIMIT_METHOD" != "cgroup" ]] && return 0
-  cgroup_set_percent 100
+  set -e
 }
 # cpulimit 附着到当前工作线程
 cpulimit_apply_for_pids() {
@@ -443,15 +445,27 @@ cpulimit_apply_for_pids() {
     CPULIMIT_WATCHERS+=("$!")
   done
 }
-# 统一入口：设置瞬时限额
+# 统一入口：设置瞬时限额（cpulimit: pct>=100 则直接清除监控）
 limit_apply_percent() {
+  set +e
   local pct="$1"
   detect_limit_method
   case "$LIMIT_METHOD" in
-    cgroup)   cgroup_set_percent "$pct" ;;
-    cpulimit) cpulimit_apply_for_pids "$pct" ;;
-    *) echo "${C_YELLOW}[!] 本机无 cgroup v2 写权限也未安装 cpulimit，无法精确限速。${C_RESET}" ;;
+    cgroup)
+      cgroup_set_percent "$pct"
+      ;;
+    cpulimit)
+      if (( pct >= 100 )); then
+        kill_cpulimit_watchers
+      else
+        cpulimit_apply_for_pids "$pct"
+      fi
+      ;;
+    *)
+      echo "${C_YELLOW}[!] 本机无 cgroup v2 写权限也未安装 cpulimit，无法精确限速。${C_RESET}"
+      ;;
   esac
+  set -e
 }
 # 周期限速调度器（5min@90% → 10min@50%）
 limit_scheduler() {
@@ -464,12 +478,14 @@ start_limit_scheduler() { is_scheduler_running || { limit_scheduler & LIMITER_PI
 stop_limit_scheduler() { kill_scheduler; }
 # 模式切换
 limit_set_mode() {
+  set +e
   local mode="$1"
   detect_limit_method
   case "$mode" in
     0)
       LIMIT_MODE=0
       stop_limit_scheduler
+      kill_cpulimit_watchers
       limit_apply_percent 100
       echo "${C_GREEN}[+] 已清除 CPU 限制。${C_RESET}"
       ;;
@@ -486,6 +502,7 @@ limit_set_mode() {
       start_limit_scheduler
       ;;
   esac
+  set -e
 }
 ensure_limit_on_current_run() {
   (( LIMIT_MODE==0 )) && return 0
@@ -652,7 +669,7 @@ interactive_start() {
     END_TS=0; echo "[*] 将一直运行，直到手动停止。"
   elif [[ "$hours" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     local secs; secs=$(awk -v h="$hours" 'BEGIN{printf "%.0f", h*3600}')
-    END_TS=$(( $(date +%s) + secs )); echo "[*] 预计运行 ${hours} 小时，至 $(date -d @"$END_TS" "+%F %T") 停止。"
+    END_TS=$(( $(date +%s) + secs )); echo "[*] 预计运行 ${hours} 次，至 $(date -d @"$END_TS" "+%F %T") 停止。"
   else
     echo "${C_YELLOW}[!] 非法输入，改为一直运行。${C_RESET}"; END_TS=0
   fi
