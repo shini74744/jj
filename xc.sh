@@ -1,30 +1,33 @@
 #!/usr/bin/env bash
 # 流量消耗/测速脚本（数字模式 + 彩色菜单 + 实时统计 + 定时汇总 + 仅脚本限速 + 强力清理）
-# 变更：分块分离(CHUNK_MB_DL/UL)、默认仅CF上行(留空时)、智能分配线程（偶数均分/奇数自动偏向更受限的一方或默认给上传）
-# 新增：菜单 2「限制模式（CPU）」：1) 恒定 50%  2) 5min@90% / 10min@50%  3) 清除；
-#       在菜单 2 设置后，对菜单 1 的“开始消耗”自动生效；运行中切换也会即时生效。
+# 新增：CPU 限制模式；下载“黏住好链接”策略；/tmp 满自动换临时目录
 
-# 注意：移除了 -e（出错即退出），避免在 cgroup/cpulimit 不可用时直接退回 shell
 set -Euo pipefail
 
 #############################
 # 可自定义默认值 / 首选项
 #############################
-DEFAULT_THREADS=${DEFAULT_THREADS:-6}     # 留空兜底（实际会按 CPU 自动估算）
-SUMMARY_INTERVAL=${SUMMARY_INTERVAL:-0}   # 定时汇总秒数；0=关闭
+DEFAULT_THREADS=${DEFAULT_THREADS:-6}
+SUMMARY_INTERVAL=${SUMMARY_INTERVAL:-0}
 
 # 连通性与下载/上传行为
 IP_VERSION=${IP_VERSION:-4}     # 4=仅IPv4, 6=仅IPv6, 0=自动
-FORCE_HTTP1=${FORCE_HTTP1:-1}   # 1=强制 HTTP/1.1
-ALWAYS_CHUNK=${ALWAYS_CHUNK:-1} # 1=总是按固定分块；0=先整段→失败再兜底分块
+FORCE_HTTP1=${FORCE_HTTP1:-1}
+ALWAYS_CHUNK=${ALWAYS_CHUNK:-1}
 
 # 分块分离（MB）
-CHUNK_MB_DL=${CHUNK_MB_DL:-50}  # 下载每块大小
-CHUNK_MB_UL=${CHUNK_MB_UL:-10}  # 上传每块大小（默认更小以提升上传打印频率）
+CHUNK_MB_DL=${CHUNK_MB_DL:-50}
+CHUNK_MB_UL=${CHUNK_MB_UL:-10}
+
+# —— 下载“黏住好链接”策略（可用环境变量覆盖）——
+STICKY_ENABLE=${STICKY_ENABLE:-1}         # 1=开启；0=关闭
+STICKY_MIN_MBPS=${STICKY_MIN_MBPS:-5}     # “有速度”阈值（MB/s）
+STICKY_BAD_ROUNDS=${STICKY_BAD_ROUNDS:-3} # 连续低速轮数才切换
+STICKY_GRACE_SEC=${STICKY_GRACE_SEC:-8}   # 每轮前 N 秒预热期
 
 # 启动后是否等到第一条线程输出再回到菜单
-START_WAIT_FIRST_OUTPUT=${START_WAIT_FIRST_OUTPUT:-1}  # 1=开启, 0=关闭
-START_WAIT_SPINS=${START_WAIT_SPINS:-30}               # 最多等待次数；0.1s/次 → 30 ≈ 3秒
+START_WAIT_FIRST_OUTPUT=${START_WAIT_FIRST_OUTPUT:-1}
+START_WAIT_SPINS=${START_WAIT_SPINS:-30}
 
 # 颜色/样式
 init_colors() {
@@ -70,7 +73,7 @@ URLS=(
   "https://speed.cloudflare.com/__down?bytes=104857600"
 )
 
-# 上传地址池（HTTP 直传；默认仅 CF 上行）
+# 上传地址池
 UPLOAD_URLS=(
   "https://speed.cloudflare.com/__up"
   "https://httpbin.org/post"
@@ -95,12 +98,12 @@ UL_TOTAL_FILE=""
 DL_LIMIT_MB=0
 UL_LIMIT_MB=0
 
-## ===== CPU 限制相关（新增） =====
+## ===== CPU 限制相关 =====
 LIMIT_MODE=0              # 0=无, 1=恒定50%, 2=5min@90%/10min@50%
 LIMIT_METHOD=""           # "cgroup" | "cpulimit" | "none"
-CGROUP_DIR=""             # cgroup v2 路径
-LIMITER_PID=              # 周期限速调度器 PID（mode=2）
-CPULIMIT_WATCHERS=()      # cpulimit 进程 PID 数组
+CGROUP_DIR=""
+LIMITER_PID=
+CPULIMIT_WATCHERS=()
 
 #############################
 # 工具函数
@@ -149,25 +152,20 @@ show_status() {
     "$(is_running && echo "${C_GREEN}运行中${C_RESET}" || echo "${C_YELLOW}未运行${C_RESET}")" \
     "${MODE:-N/A}" "${DL_THREADS:-0}" "${UL_THREADS:-0}"
   printf "  总计: 下载 %s MB / 上传 %s MB\n" "$(bytes_to_mb "$dl_g")" "$(bytes_to_mb "$ul_g")"
-  printf "  限速(总): DL=%s MB/s, UL=%s MB/s; 每线程≈ DL=%s MB/s, UL=%s MB/s\n" \
+  printf "  限速: DL=%s MB/s, UL=%s MB/s; 每线程≈ DL=%s MB/s, UL=%s MB/s\n" \
     "$DL_LIMIT_MB" "$UL_LIMIT_MB" "$dl_thr_mb" "$ul_thr_mb"
   printf "  汇总: %s   结束: %s\n" \
     "$( ((SUMMARY_INTERVAL>0)) && echo "每 ${SUMMARY_INTERVAL}s" || echo "关闭")" \
     "$( ((END_TS>0)) && date -d @"$END_TS" "+%F %T" || echo "手动停止")"
-  printf "  限制模式: %s（方法: %s）\n" \
+  printf "  限制模式: %s  限制方法: %s\n" \
     "$(
        case "$LIMIT_MODE" in
          0) echo "关闭" ;;
-         1) echo "恒定 50%" ;;
-         2) echo "5min@90% / 10min@50%" ;;
+         1) echo "恒定50%%" ;;
+         2) echo "5min@90%% / 10min@50%%" ;;
        esac
      )" \
-    "$(
-       case "$LIMIT_METHOD" in
-         "") echo "-" ;;
-         *)  echo "$LIMIT_METHOD" ;;
-       esac
-     )"
+    "$([[ -n "$LIMIT_METHOD" ]] && echo "$LIMIT_METHOD" || echo "-")"
   echo "${C_BOLD}└────────────────────────────────────────────────────────┘${C_RESET}"
 }
 
@@ -259,7 +257,7 @@ calc_ul_thread_bps() {
 }
 
 #############################
-# curl 封装
+# curl 封装（回传 size 与 time_total）
 #############################
 curl_measure_dl_range() {
   local url="$1" range_end="$2" limit_bps="${3:-0}"
@@ -271,7 +269,7 @@ curl_measure_dl_range() {
     -A "Mozilla/5.0" \
     -H "Range: bytes=0-${range_end}" \
     "${extra[@]}" \
-    -w '%{size_download}' \
+    -w '%{size_download} %{time_total}' \
     -o /dev/null "$url" 2>/dev/null || true
 }
 
@@ -284,54 +282,85 @@ curl_measure_full() {
     --retry 3 --retry-delay 1 --retry-all-errors \
     -A "Mozilla/5.0" \
     "${extra[@]}" \
-    -w '%{size_download} %{http_code} %{url_effective}' \
+    -w '%{size_download} %{http_code} %{time_total} %{url_effective}' \
     -o /dev/null "$url" 2>/dev/null || true
 }
 
-curl_measure_upload() {
-  local url="$1" bytes="$2" limit_bps="${3:-0}"
-  local extra=(); (( limit_bps > 0 )) && extra+=(--limit-rate "$limit_bps")
-  head -c "$bytes" /dev/zero | \
-    curl -sS -L \
-      "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
-      --connect-timeout 10 --max-time 600 \
-      --retry 2 --retry-all-errors \
-      -A "Mozilla/5.0" \
-      -H "Content-Type: application/octet-stream" \
-      "${extra[@]}" \
-      --data-binary @- \
-      -w '%{size_upload} %{http_code}' \
-      -o /dev/null \
-      -X POST "$url" 2>/dev/null || true
-}
-
 #############################
-# 工作线程
+# 工作线程（下载：黏住好链接策略）
 #############################
 download_worker() {
   local id="$1"; local thread_sum=0
+
+  local sticky_url=""
+  local bad_rounds=0
+
   while true; do
     (( END_TS > 0 )) && (( $(date +%s) >= END_TS )) && break
-    local url="${ACTIVE_URLS[RANDOM % ${#ACTIVE_URLS[@]}]}"
-    local final="${url}?nocache=$(date +%s%N)-$id-$RANDOM"
+
+    local base_url=""
+    if (( STICKY_ENABLE )); then
+      if [[ -z "$sticky_url" ]]; then
+        sticky_url="${ACTIVE_URLS[RANDOM % ${#ACTIVE_URLS[@]}]}"
+      fi
+      base_url="$sticky_url"
+    else
+      base_url="${ACTIVE_URLS[RANDOM % ${#ACTIVE_URLS[@]}]}"
+    fi
+
+    local final="${base_url}?nocache=$(date +%s%N)-$id-$RANDOM"
     local limit_bps; limit_bps=$(calc_dl_thread_bps)
-    local bytes=0
+
+    local bytes=0 secs=0
     if (( ALWAYS_CHUNK )); then
       local range_end=$(( CHUNK_MB_DL*1048576 - 1 ))
       local res2; res2=$(curl_measure_dl_range "$final" "$range_end" "$limit_bps")
-      [[ -n "$res2" && "$res2" =~ ^[0-9]+$ ]] && bytes="$res2" || bytes=0
+      read -r bytes secs <<<"${res2:-"0 0"}"
+      [[ -z "$bytes" ]] && bytes=0
+      [[ -z "$secs"  ]] && secs=0
     else
-      local res code="000"
+      local res code="000" t="0"
       res="$(curl_measure_full "$final" "$limit_bps")"
       if [[ -n "$res" ]]; then
-        bytes="${res%% *}"; res="${res#* }"; code="${res%% *}"
+        bytes="${res%% *}"; res="${res#* }"
+        code="${res%% *}";  res="${res#* }"
+        t="${res%% *}"
       fi
+      secs="$t"
       if [[ -z "$bytes" || "$bytes" == "0" || ( "$code" != "200" && "$code" != "206" ) ]]; then
         local range_end=$(( CHUNK_MB_DL*1048576 - 1 ))
         local res2; res2=$(curl_measure_dl_range "$final" "$range_end" "$limit_bps")
-        [[ -n "$res2" && "$res2" =~ ^[0-9]+$ ]] && bytes="$res2" || bytes=0
+        read -r bytes secs <<<"${res2:-"0 0"}"
+        [[ -z "$bytes" ]] && bytes=0
+        [[ -z "$secs"  ]] && secs=0
       fi
     fi
+
+    local thr_limit_mbps; thr_limit_mbps=$(awk -v l="$limit_bps" 'BEGIN{if(l>0) printf "%.2f", l/1048576*0.7; else print 0}')
+    local need_mbps; need_mbps=$(awk -v base="$STICKY_MIN_MBPS" -v lim="$thr_limit_mbps" 'BEGIN{if(lim>0 && lim<base) printf "%.2f", lim; else printf "%.2f", base}')
+    local speed_mbps; speed_mbps=$(awk -v b="$bytes" -v s="$secs" 'BEGIN{if(s>0) printf "%.2f", b/1048576/s; else print 0}')
+
+    local verdict
+    verdict=$(awk -v s="$speed_mbps" -v need="$need_mbps" -v sec="$secs" -v grace="$STICKY_GRACE_SEC" 'BEGIN{
+      if (sec < grace && sec > 0)      {print "neutral"}
+      else if (s >= need && s > 0)     {print "good"}
+      else                              {print "bad"}
+    }')
+
+    if (( STICKY_ENABLE )); then
+      case "$verdict" in
+        good)    bad_rounds=0 ;;
+        neutral) : ;;
+        bad)
+          bad_rounds=$((bad_rounds+1))
+          if (( bad_rounds >= STICKY_BAD_ROUNDS )); then
+            sticky_url=""
+            bad_rounds=0
+          fi
+          ;;
+      esac
+    fi
+
     thread_sum=$((thread_sum + bytes))
     print_dl_status "$id" "$final" "$bytes" "$thread_sum"
   done
@@ -370,10 +399,10 @@ summary_worker() { while true; do sleep "$SUMMARY_INTERVAL"; print_summary_once;
 start_summary() {
   if (( SUMMARY_INTERVAL > 0 )); then
     if is_summary_running; then
-      echo "${C_YELLOW}[*] 定时汇总已在运行（每 ${SUMMARY_INTERVAL}s）。${C_RESET}"
+      echo "${C_YELLOW}[*] 定时汇总已在运行，每 ${SUMMARY_INTERVAL}s 一次。${C_RESET}"
     else
       summary_worker & SUMMARY_PID=$!
-      echo "${C_GREEN}[*] 已开启定时汇总（每 ${SUMMARY_INTERVAL}s），PID=${SUMMARY_PID}${C_RESET}"
+      echo "${C_GREEN}[*] 已开启定时汇总，每 ${SUMMARY_INTERVAL}s 一次，PID=${SUMMARY_PID}${C_RESET}"
     fi
   fi
 }
@@ -387,7 +416,7 @@ stop_summary() {
 }
 
 #############################
-# 清理辅助（强力）
+# 清理辅助
 #############################
 kill_tree_once() {
   local sig="$1"
@@ -400,7 +429,7 @@ kill_tree_once() {
 }
 
 #############################
-# CPU 限制实现（新增，带容错）
+# CPU 限制实现
 #############################
 cores_count() {
   if command -v nproc >/dev/null 2>&1; then nproc; else echo 1; fi
@@ -424,7 +453,6 @@ kill_cpulimit_watchers() {
     CPULIMIT_WATCHERS=()
   fi
 }
-# cgroup 路径准备 & 进入本脚本进程（子进程会继承）
 cgroup_enter_self() {
   set +e
   [[ "$LIMIT_METHOD" != "cgroup" ]] && { set -e; return 0; }
@@ -435,7 +463,6 @@ cgroup_enter_self() {
   [[ -w "$CGROUP_DIR/cgroup.procs" ]] && echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
   set -e
 }
-# 按总 CPU 百分比设置限额（多核按总和计算）
 cgroup_set_percent() {
   set +e
   local pct="$1"
@@ -451,7 +478,6 @@ cgroup_set_percent() {
   echo "$quota $period" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
   set -e
 }
-# cpulimit 附着到当前工作线程
 cpulimit_apply_for_pids() {
   local pct="$1"
   kill_cpulimit_watchers
@@ -462,7 +488,6 @@ cpulimit_apply_for_pids() {
     CPULIMIT_WATCHERS+=("$!")
   done
 }
-# 统一入口：设置瞬时限额（cpulimit: pct>=100 则直接清除监控）
 limit_apply_percent() {
   set +e
   local pct="$1"
@@ -479,21 +504,19 @@ limit_apply_percent() {
       fi
       ;;
     *)
-      echo "${C_YELLOW}[!] 本机无 cgroup v2 写权限也未安装 cpulimit，无法精确限速。${C_RESET}"
+      echo "${C_YELLOW}[!] 无 cgroup 写权限且未安装 cpulimit，无法精确限速。${C_RESET}"
       ;;
   esac
   set -e
 }
-# 周期限速调度器（5min@90% → 10min@50%）
 limit_scheduler() {
   while true; do
     limit_apply_percent 90; sleep 300
     limit_apply_percent 50; sleep 600
   done
 }
-start_limit_scheduler() { is_scheduler_running || { limit_scheduler & LIMITER_PID=$!; echo "${C_GREEN}[*] 周期限速已启用：5min@90% / 10min@50%。${C_RESET}"; }; }
+start_limit_scheduler() { is_scheduler_running || { limit_scheduler & LIMITER_PID=$!; echo "${C_GREEN}[*] 周期限速已启用。${C_RESET}"; }; }
 stop_limit_scheduler() { kill_scheduler; }
-# 模式切换
 limit_set_mode() {
   set +e
   local mode="$1"
@@ -525,11 +548,11 @@ ensure_limit_on_current_run() {
   (( LIMIT_MODE==0 )) && return 0
   detect_limit_method
   if [[ "$LIMIT_METHOD" == "cgroup" ]]; then
-    if (( LIMIT_MODE==1 )); then limit_apply_percent 50; fi
-    if (( LIMIT_MODE==2 )); then start_limit_scheduler; fi
+    (( LIMIT_MODE==1 )) && limit_apply_percent 50
+    (( LIMIT_MODE==2 )) && start_limit_scheduler
   elif [[ "$LIMIT_METHOD" == "cpulimit" ]]; then
-    if (( LIMIT_MODE==1 )); then cpulimit_apply_for_pids 50; fi
-    if (( LIMIT_MODE==2 )); then start_limit_scheduler; fi
+    (( LIMIT_MODE==1 )) && cpulimit_apply_for_pids 50
+    (( LIMIT_MODE==2 )) && start_limit_scheduler
   fi
 }
 
@@ -547,24 +570,21 @@ wait_first_output() {
 }
 
 smart_split_threads() {
-  # 输入：$1 = total_threads；输出：设置全局 DL_THREADS / UL_THREADS
   local total="$1"
   if (( total <= 1 )); then DL_THREADS=1; UL_THREADS=0; return; fi
   if (( total % 2 == 0 )); then
     DL_THREADS=$(( total/2 )); UL_THREADS=$(( total/2 )); return
   fi
-  # 奇数：优先依据限速判断“更受限的一方”，否则默认给上传
-  extra_side="ul" # 默认给上传
-  dl_pos=$(awk -v x="$DL_LIMIT_MB" 'BEGIN{print (x>0)?1:0}')
-  ul_pos=$(awk -v x="$UL_LIMIT_MB" 'BEGIN{print (x>0)?1:0}')
+  local extra_side="ul"
+  local dl_pos=$(awk -v x="$DL_LIMIT_MB" 'BEGIN{print (x>0)?1:0}')
+  local ul_pos=$(awk -v x="$UL_LIMIT_MB" 'BEGIN{print (x>0)?1:0}')
   if (( dl_pos==1 || ul_pos==1 )); then
     if (( dl_pos==1 && ul_pos==0 )); then
       extra_side="dl"
     elif (( dl_pos==0 && ul_pos==1 )); then
       extra_side="ul"
     else
-      cmp=$(awk -v dl="$DL_LIMIT_MB" -v ul="$UL_LIMIT_MB" 'BEGIN{if(dl<ul) print "dl"; else print "ul"}')
-      extra_side="$cmp"
+      extra_side=$(awk -v dl="$DL_LIMIT_MB" -v ul="$UL_LIMIT_MB" 'BEGIN{if(dl<ul) print "dl"; else print "ul"}')
     fi
   fi
   if [[ "$extra_side" == "dl" ]]; then
@@ -577,14 +597,13 @@ smart_split_threads() {
 start_consumption() {
   local mode="$1" dl_n="$2" ul_n="$3"
   [[ "$mode" =~ ^(d|u|b)$ ]] || { echo "[-] 内部错误：mode 无效"; return 1; }
-  init_and_check || { echo "${C_RED}无法启动：初始化失败（可能 /tmp 无空间或未安装 curl）。${C_RESET}"; return 1; }
+  init_and_check || { echo "${C_RED}无法启动：初始化失败（可能无空间或未安装 curl）。${C_RESET}"; return 1; }
   MODE="$mode"; PIDS=()
 
   echo "${C_BOLD}[*] $(human_now) 启动：模式=${MODE}  下载线程=${dl_n}  上传线程=${ul_n}${C_RESET}"
   echo "[*] 定时汇总：$( ((SUMMARY_INTERVAL>0)) && echo "每 ${SUMMARY_INTERVAL}s" || echo "关闭" )"
   (( END_TS > 0 )) && echo "[*] 预计结束于：$(date -d @"$END_TS" "+%F %T")"
 
-  # 若已配置 CPU 限制：在启动前准备好环境（cgroup 需先入组）
   if (( LIMIT_MODE>0 )); then
     detect_limit_method
     [[ "$LIMIT_METHOD" == "cgroup" ]] && cgroup_enter_self
@@ -598,10 +617,8 @@ start_consumption() {
   fi
 
   start_summary
-  echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 或选菜单 3 可停止。${C_RESET}"
+  echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 或选菜单 3 停止。${C_RESET}"
   wait_first_output
-
-  # 子进程已就绪后，确保限速应用到当前运行（cpulimit 需要此步骤）
   ensure_limit_on_current_run
 }
 
@@ -619,7 +636,6 @@ stop_consumption() {
     done
     PIDS=()
   fi
-  # 停掉 cpulimit watchers（周期调度器保留，以便后续启动仍自动生效）
   kill_cpulimit_watchers
   stop_summary
   local dl_g=0 ul_g=0
@@ -631,7 +647,7 @@ stop_consumption() {
 }
 
 #############################
-# 交互：启动（默认=3 同时）
+# 交互：启动
 #############################
 list_download_urls() {
   echo; echo "${C_BOLD}下载地址（共 ${#URLS[@]} 个）：${C_RESET}"
@@ -644,9 +660,9 @@ list_upload_urls() {
 
 interactive_start() {
   echo; echo "${C_BOLD}请选择消耗模式：${C_RESET}"
-  echo "  1) 下载（仅下行）"
-  echo "  2) 上传（仅上行）"
-  echo "  3) 同时（上下行）"
+  echo "  1) 下载"
+  echo "  2) 上传"
+  echo "  3) 同时"
   read -rp "模式 [1-3]（默认 3）: " mode_num || true
   [[ -z "${mode_num// /}" ]] && mode_num=3
   case "$mode_num" in
@@ -724,25 +740,25 @@ configure_summary() {
 }
 
 #############################
-# 限速设置（仅脚本进程）
+# 限速设置
 #############################
 configure_limits() {
-  echo "${C_BOLD}当前限速（总速，MB/s）：DL=${DL_LIMIT_MB}，UL=${UL_LIMIT_MB}${C_RESET}"
-  echo "  1) 限制上传速度（多少 M，总速，自动均分到线程）"
-  echo "  2) 限制下载速度（多少 M，总速，自动均分到线程）"
-  echo "  3) 同时限速（上下行都设为同样的 M）"
+  echo "${C_BOLD}当前限速：DL=${DL_LIMIT_MB} MB/s，UL=${UL_LIMIT_MB} MB/s${C_RESET}"
+  echo "  1) 限制上传速度"
+  echo "  2) 限制下载速度"
+  echo "  3) 同时限速"
   echo "  4) 清除全部限速"
   read -rp "选择 [1-4]: " sub || true
   case "${sub:-}" in
-    1) read -rp "输入上传总速（MB/s，0 取消限速）: " v || true
+    1) read -rp "输入上传总速（MB/s，0 取消）: " v || true
        [[ -z "${v// /}" ]] && { echo "未更改。"; return; }
        if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then UL_LIMIT_MB="$v"; echo "${C_GREEN}[+] 已设置上传总速为 ${UL_LIMIT_MB} MB/s。${C_RESET}"
        else echo "${C_YELLOW}[-] 输入无效。${C_RESET}"; fi ;;
-    2) read -rp "输入下载总速（MB/s，0 取消限速）: " v || true
+    2) read -rp "输入下载总速（MB/s，0 取消）: " v || true
        [[ -z "${v// /}" ]] && { echo "未更改。"; return; }
        if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then DL_LIMIT_MB="$v"; echo "${C_GREEN}[+] 已设置下载总速为 ${DL_LIMIT_MB} MB/s。${C_RESET}"
        else echo "${C_YELLOW}[-] 输入无效。${C_RESET}"; fi ;;
-    3) read -rp "输入上下行总速（MB/s，0 取消限速）: " v || true
+    3) read -rp "输入上下行总速（MB/s，0 取消）: " v || true
        [[ -z "${v// /}" ]] && { echo "未更改。"; return; }
        if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then DL_LIMIT_MB="$v"; UL_LIMIT_MB="$v"; echo "${C_GREEN}[+] 已将上下行总速都设为 ${v} MB/s。${C_RESET}"
        else echo "${C_YELLOW}[-] 输入无效。${C_RESET}"; fi ;;
@@ -752,28 +768,26 @@ configure_limits() {
 
   if (( DL_LIMIT_MB > 0 )) && (( DL_THREADS > 0 )); then
     local per=$(awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
-    echo "  下载每线程≈ ${per} MB/s（curl --limit-rate）"
+    echo "  下载每线程≈ ${per} MB/s - curl --limit-rate"
   fi
   if (( UL_LIMIT_MB > 0 )) && (( UL_THREADS > 0 )); then
     local per=$(awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
-    echo "  上传每线程≈ ${per} MB/s（curl --limit-rate）"
+    echo "  上传每线程≈ ${per} MB/s - curl --limit-rate"
   fi
-
-  echo "${C_DIM}（说明：限速仅作用于本脚本启动的 curl 进程，不影响系统其他进程或网卡全局配置）${C_RESET}"
 }
 
 #############################
-# 限制模式菜单（新增）
+# 限制模式菜单
 #############################
 configure_cpu_limit_mode() {
-  echo "${C_BOLD}限制模式（CPU）：${C_RESET}当前 = $(
+  echo "${C_BOLD}限制模式：${C_RESET}当前 = $(
     case "$LIMIT_MODE" in
       0) echo "关闭" ;;
-      1) echo "恒定 50%" ;;
-      2) echo "周期 5min@90% / 10min@50%" ;;
+      1) echo "恒定50%" ;;
+      2) echo "5min@90% / 10min@50%" ;;
     esac
   )"
-  echo "  1) 限制到 50% 以下（恒定）"
+  echo "  1) 限制到 50%"
   echo "  2) 5 分钟 90%，10 分钟 50%，循环"
   echo "  3) 清除限制"
   read -rp "选择 [1-3]: " lm || true
@@ -783,7 +797,7 @@ configure_cpu_limit_mode() {
     3) limit_set_mode 0 ;;
     *) echo "${C_YELLOW}无效选择，未更改。${C_RESET}" ;;
   esac
-  echo "${C_DIM}说明：优先使用 cgroup v2（需可写 /sys/fs/cgroup），否则回退到 cpulimit。若均不可用，将仅提示无法精确限速。${C_RESET}"
+  echo "${C_DIM}说明：优先使用 cgroup v2（需可写 /sys/fs/cgroup），否则回退到 cpulimit；若均不可用，将提示无法精确限速。${C_RESET}"
 }
 
 #############################
@@ -797,12 +811,12 @@ menu() {
     echo "${C_BOLD}┌────────────────────── 流量消耗/测速 工具 ──────────────────────┐${C_RESET}"
     show_status
     echo "${C_BOLD}├──────────────────────────────── 菜 单 ─────────────────────────┤${C_RESET}"
-    echo "  1) 开始消耗（交互式：上传/下载/同时、线程、地址、时长）"
-    echo "  2) 限制模式（CPU：50% / 5min@90%→10min@50% / 清除）"
-    echo "  3) 停止全部线程（显示最终汇总）"
-    echo "  4) 查看地址池（下载/上传）"
-    echo "  5) 设置/关闭定时汇总（每 N 秒）"
-    echo "  6) 限速设置（仅脚本生效）"
+    echo "  1) 开始消耗"
+    echo "  2) 限制模式"
+    echo "  3) 停止全部线程"
+    echo "  4) 查看地址池"
+    echo "  5) 设置/关闭定时汇总"
+    echo "  6) 限速设置"
     echo "  0) 退出"
     echo "${C_BOLD}└────────────────────────────────────────────────────────────────┘${C_RESET}"
     read -rp "请选择 [0-6]: " c || true
