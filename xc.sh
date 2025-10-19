@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # 流量消耗/测速脚本（彩色菜单 + 实时统计 + 定时汇总 + 仅脚本限速 + CPU限制
-# + 健康检查 + 黏住好链接 + IPv4/IPv6 自动选择 + HTTP/2/HTTP/1 自动选择
-# + 单地址预检（下载/上传）+ URL 缓存参数智能拼接）
-# 关键修复：
-# - 追加 nocache 参数时会根据是否已有 ? 改用 &，修复 “双 ？” 导致的线程不跑问题
-# - 修正状态栏“限制模式”显示
+# + 健康检查 + 黏住好链接 + IPv4/IPv6 自动选择 + HTTP/2/HTTP/1 自动选择）
+# - 健康检查：每次分配 URL 前，分别探测 v4/v6 与 HTTP/2/HTTP/1.1。都不通 → 拉黑 5 分钟。
+# - 自动选择：v4/v6 都通时，选更快的；HTTP/2/1.1 都可用时，选更快的。
+# - 黏住好链接：有速度就不换；连续多轮低速才切换。
 
 set -Euo pipefail
 
@@ -29,12 +28,11 @@ STICKY_MIN_MBPS=${STICKY_MIN_MBPS:-5}
 STICKY_BAD_ROUNDS=${STICKY_BAD_ROUNDS:-3}
 STICKY_GRACE_SEC=${STICKY_GRACE_SEC:-8}
 
-# 健康检查 / 拉黑 / 预检
+# 健康检查 / 拉黑
 BLACKLIST_TTL=${BLACKLIST_TTL:-300}          # 秒，默认 5 分钟
 PROBE_CONNECT_TIMEOUT=${PROBE_CONNECT_TIMEOUT:-4}
 PROBE_MAX_TIME=${PROBE_MAX_TIME:-8}
-PROBE_RANGE_MB=${PROBE_RANGE_MB:-1}          # 下载探测块大小(默认 1MB)
-PROBE_UPLOAD_KB=${PROBE_UPLOAD_KB:-1024}     # 上传探测块大小(默认 1MB)
+PROBE_RANGE_MB=${PROBE_RANGE_MB:-1}          # 探测用区间大小(下载)，默认 1MB
 
 # 启动后是否等到第一条线程输出再回到菜单
 START_WAIT_FIRST_OUTPUT=${START_WAIT_FIRST_OUTPUT:-1}
@@ -97,15 +95,6 @@ declare -A BL_DL; declare -A BL_UL
 human_now(){ date "+%F %T"; }
 now_ts(){ date +%s; }
 bytes_to_mb(){ awk -v b="$1" 'BEGIN{printf "%.2f", b/1048576}'; }
-ms(){ awk -v s="$1" 'BEGIN{printf "%.2f", s*1000}'; }
-
-# 正确拼接 nocache 参数（关键修复）
-add_cb(){
-  local u="$1" id="$2"
-  local d="?"
-  [[ "$u" == *\?* ]] && d="&"
-  echo "${u}${d}nocache=$(date +%s%N)-${id}-${RANDOM}"
-}
 
 auto_threads(){
   local cores=1
@@ -132,13 +121,6 @@ show_status(){
   local dl_thr_mb="-" ul_thr_mb="-"
   ((DL_LIMIT_MB>0&&DL_THREADS>0))&&dl_thr_mb=$(awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
   ((UL_LIMIT_MB>0&&UL_THREADS>0))&&ul_thr_mb=$(awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
-  local lm_text="关闭"
-  case "$LIMIT_MODE" in
-    1) lm_text="恒定50%" ;;
-    2) lm_text="5min@90% / 10min@50%" ;;
-  esac
-  local lm_method="-"; [[ -n "$LIMIT_METHOD" ]] && lm_method="$LIMIT_METHOD"
-
   echo "${C_BOLD}┌───────────────────────── 状态 ─────────────────────────┐${C_RESET}"
   printf "  运行: %s   模式: %s   线程: DL=%s / UL=%s\n" \
     "$(is_running&&echo "${C_GREEN}运行中${C_RESET}"||echo "${C_YELLOW}未运行${C_RESET}")" \
@@ -149,27 +131,17 @@ show_status(){
   printf "  汇总: %s   结束: %s\n" \
     "$( ((SUMMARY_INTERVAL>0))&&echo "每 ${SUMMARY_INTERVAL}s"||echo "关闭")" \
     "$( ((END_TS>0))&&date -d @"$END_TS" "+%F %T"||echo "手动停止")"
-  printf "  限制模式: %s  限制方法: %s\n" "$lm_text" "$lm_method"
+  printf "  限制模式: %s  限制方法: %s\n" \
+    "$((LIMIT_MODE==0))&&echo 关闭 || { ((LIMIT_MODE==1))&&echo 恒定50% || echo '5min@90% / 10min@50%'; }" \
+    "$([[ -n "$LIMIT_METHOD" ]]&&echo "$LIMIT_METHOD"||echo "-")"
   echo "${C_BOLD}└────────────────────────────────────────────────────────┘${C_RESET}"
 }
 
-#############################
-# 输入解析：编号 或 直接URL（可混填）
-#############################
-parse_mixed_selection(){
-  local input="$1" src="$2" dst="$3"
-  local -n _SRC="$src"; local -n _DST="$dst"; _DST=()
-  [[ -z "${input// /}" ]] && { _DST=("${_SRC[@]}"); return; }
-  IFS=',' read -r -a items <<<"$input"
-  for raw in "${items[@]}"; do
-    local tok="${raw#"${raw%%[![:space:]]*}"}"; tok="${tok%"${tok##*[![:space:]]}"}"
-    [[ -z "$tok" ]] && continue
-    if [[ "$tok" =~ ^https?:// ]]; then
-      _DST+=("$tok")
-    elif [[ "$tok" =~ ^[0-9]+$ ]]; then
-      local n="$tok"; (( n>=1 && n<=${#_SRC[@]} )) && _DST+=("${_SRC[$((n-1))]}")
-    fi
-  done
+parse_choice_to_array(){
+  local input="$1" src="$2" dst="$3"; local -n _SRC="$src"; local -n _DST="$dst"; _DST=()
+  [[ -z "${input// /}" ]]&&{ _DST=("${_SRC[@]}"); return; }
+  IFS=',' read -r -a idxs <<<"$input"
+  for raw in "${idxs[@]}"; do local n="${raw//[[:space:]]/}"; [[ "$n" =~ ^[0-9]+$ ]]||continue; (( n>=1 && n<=${#_SRC[@]} ))||continue; _DST+=("${_SRC[$((n-1))]}"); done
   [[ ${#_DST[@]} -gt 0 ]] || _DST=("${_SRC[@]}")
 }
 
@@ -216,20 +188,21 @@ calc_ul_thread_bps(){ ((UL_LIMIT_MB>0&&UL_THREADS>0)) && awk -v mb="$UL_LIMIT_MB
 _build_ipopt(){ local fam="${1:-0}"; [[ "$fam" == "4" ]]&&echo "-4" || { [[ "$fam" == "6" ]]&&echo "-6" || true; }; }
 _build_protoopt(){ local proto="${1:-2}"; [[ "$proto" == "2" ]]&&echo "--http2" || echo "--http1.1"; }
 
-# 下载探测，输出: size time_total http_code http_version time_connect
-curl_measure_dl_range(){
+curl_measure_dl_range(){ # url range_end limit_bps fam proto
   local url="$1" range_end="$2" limit_bps="${3:-0}" fam="${4:-0}" proto="${5:-2}"
-  local ipopt=(); local protoopt=(); ipopt+=($(_build_ipopt "$fam")); protoopt+=($(_build_protoopt "$proto"))
+  local ipopt=(); local protoopt=()
+  ipopt+=($(_build_ipopt "$fam")); protoopt+=($(_build_protoopt "$proto"))
   local extra=(); ((limit_bps>0))&&extra+=(--limit-rate "$limit_bps")
   curl -sS -L "${ipopt[@]}" "${protoopt[@]}" \
     --connect-timeout 10 --max-time 300 --retry 2 --retry-all-errors \
     -A "Mozilla/5.0" -H "Range: bytes=0-${range_end}" "${extra[@]}" \
-    -w '%{size_download} %{time_total} %{http_code} %{http_version} %{time_connect}' \
+    -w '%{size_download} %{time_total} %{http_code} %{http_version}' \
     -o /dev/null "$url" 2>/dev/null || true
 }
 curl_measure_full(){ # url limit_bps fam proto
   local url="$1" limit_bps="${2:-0}" fam="${3:-0}" proto="${4:-2}"
-  local ipopt=(); local protoopt=(); ipopt+=($(_build_ipopt "$fam")); protoopt+=($(_build_protoopt "$proto"))
+  local ipopt=(); local protoopt=()
+  ipopt+=($(_build_ipopt "$fam")); protoopt+=($(_build_protoopt "$proto"))
   local extra=(); ((limit_bps>0))&&extra+=(--limit-rate "$limit_bps")
   curl -sS -L "${ipopt[@]}" "${protoopt[@]}" \
     --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 1 --retry-all-errors \
@@ -237,186 +210,66 @@ curl_measure_full(){ # url limit_bps fam proto
     -w '%{size_download} %{http_code} %{time_total} %{http_version} %{url_effective}' \
     -o /dev/null "$url" 2>/dev/null || true
 }
-# 上传探测，输出: size_upload http_code http_version time_total time_connect
 curl_measure_upload(){ # url bytes limit_bps fam proto
   local url="$1" bytes="$2" limit_bps="${3:-0}" fam="${4:-0}" proto="${5:-2}"
-  local ipopt=(); local protoopt=(); ipopt+=($(_build_ipopt "$fam")); protoopt+=($(_build_protoopt "$proto"))
+  local ipopt=(); local protoopt=()
+  ipopt+=($(_build_ipopt "$fam")); protoopt+=($(_build_protoopt "$proto"))
   local extra=(); ((limit_bps>0))&&extra+=(--limit-rate "$limit_bps")
   head -c "$bytes" /dev/zero | curl -sS -L "${ipopt[@]}" "${protoopt[@]}" \
     --connect-timeout 10 --max-time 600 --retry 2 --retry-all-errors \
     -A "Mozilla/5.0" -H "Content-Type: application/octet-stream" "${extra[@]}" \
-    --data-binary @- -w '%{size_upload} %{http_code} %{http_version} %{time_total} %{time_connect}' \
-    -o /dev/null -X POST "$url" 2>/dev/null || true
+    --data-binary @- -w '%{size_upload} %{http_code} %{http_version}' -o /dev/null -X POST "$url" 2>/dev/null || true
 }
 
 #############################
-# 健康检查 / 选家族/协议 / 黑名单
+# 健康检查：枚举组合，选最快
 #############################
-_probe_combo(){
+_probe_combo(){ # url fam proto -> print "ok mbps time code version"
   local url="$1" fam="$2" proto="$3"
   local range_end=$(( PROBE_RANGE_MB*1048576 - 1 )); ((range_end<0))&&range_end=0
-  local ipopt=(); local protoopt=(); ipopt+=($(_build_ipopt "$fam")); protoopt+=($(_build_protoopt "$proto"))
-  local out; out=$(curl -sS -L "${ipopt[@]}" "${protoopt[@]}" \
-    --connect-timeout "$PROBE_CONNECT_TIMEOUT" --max-time "$PROBE_MAX_TIME" --retry 1 --retry-all-errors \
-    -A "Mozilla/5.0" -H "Range: bytes=0-${range_end}" \
-    -w '%{size_download} %{time_total} %{http_code} %{http_version} %{time_connect}' \
-    -o /dev/null "$url" 2>/dev/null || true)
-  local size=0 t=0 code=000 ver="0" tconn=0; read -r size t code ver tconn <<<"${out:-"0 0 000 0 0"}"
+  local out; out="$(curl_measure_dl_range "$url" "$range_end" 0 "$fam" "$proto")"
+  # out: size time code version
+  local size=0 t=0 code=000 ver=""; read -r size t code ver <<<"${out:-"0 0 000 0"}"
   local mbps; mbps=$(awk -v b="$size" -v s="$t" 'BEGIN{if(s>0) printf "%.4f", b/1048576/s; else print 0}')
-  if [[ "$code" == "200" || "$code" == "206" ]]; then echo "ok $mbps $t $code $ver $tconn"; else echo "bad 0 $t $code $ver $tconn"; fi
+  if [[ "$code" == "200" || "$code" == "206" ]]; then echo "ok $mbps $t $code $ver"; else echo "bad 0 $t $code $ver"; fi
 }
-_probe_combo_ul(){
-  local url="$1" fam="$2" proto="$3"
-  local bytes=$(( PROBE_UPLOAD_KB*1024 ))
-  local ipopt=(); local protoopt=(); ipopt+=($(_build_ipopt "$fam")); protoopt+=($(_build_protoopt "$proto"))
-  local out; out=$(head -c "$bytes" /dev/zero | curl -sS -L "${ipopt[@]}" "${protoopt[@]}" \
-    --connect-timeout "$PROBE_CONNECT_TIMEOUT" --max-time "$PROBE_MAX_TIME" --retry 1 --retry-all-errors \
-    -A "Mozilla/5.0" -H "Content-Type: application/octet-stream" \
-    --data-binary @- -w '%{size_upload} %{http_code} %{http_version} %{time_total} %{time_connect}' \
-    -o /dev/null -X POST "$url" 2>/dev/null || true)
-  local up=0 code=000 ver="0" tt=0 tc=0; read -r up code ver tt tc <<<"${out:-"0 000 0 0 0"}"
-  local mbps; mbps=$(awk -v b="$up" -v s="$tt" 'BEGIN{if(s>0) printf "%.4f", b/1048576/s; else print 0}')
-  if [[ "$code" == "200" || "$code" == "204" || "$code" == "201" || "$code" == "202" ]]; then echo "ok $mbps $tt $code $ver $tc"; else echo "bad 0 $tt $code $ver $tc"; fi
-}
-
-decide_best_combo_for_url(){
+decide_best_combo_for_url(){ # url -> echo "fam|proto" or empty (and blacklist by caller)
   local url="$1"
-  local fams=(); case "$IP_VERSION" in 4) fams=(4) ;; 6) fams=(6) ;; *) fams=(4 6) ;; esac
-  local protos=(); (( FORCE_HTTP1 )) && protos=("1.1") || protos=(2 "1.1")
+  local fams=()
+  case "$IP_VERSION" in
+    4) fams=(4) ;; 6) fams=(6) ;; *) fams=(4 6) ;;
+  esac
+  local protos=()
+  if (( FORCE_HTTP1 )); then protos=("1.1"); else protos=(2 "1.1"); fi
+
   local best_fam="" best_proto="" best_mbps=0 best_time=999999
   for f in "${fams[@]}"; do
-    for p in "${protos[@]}"; do
-      local r; r=$(_probe_combo "$url" "$f" "$p"); [[ "$r" =~ ^ok ]] || continue
-      local _ok _mbps _t _code _ver _tc; read -r _ok _mbps _t _code _ver _tc <<<"$r"
-      if [[ "$p" == "2" && "$_ver" != "2" ]]; then continue; fi
-      if [[ "$p" == "1.1" && "$_ver" != "1.1" ]]; then continue; fi
-      local better=0 diff; diff=$(awk -v a="$_mbps" -v b="$best_mbps" 'BEGIN{if(b==0)print 1; else if(a>=b*1.05)print 1; else print 0}')
-      if (( best_mbps == 0 )) || (( diff == 1 )); then better=1
-      else smaller=$(awk -v a="$_t" -v b="$best_time" 'BEGIN{print (a<b)?1:0}'); ((smaller==1)) && better=1; fi
-      if (( better==1 )); then best_fam="$f"; best_proto="$p"; best_mbps=${_mbps%.*}.${_mbps#*.}; best_time=${_t%.*}.${_t#*.}; fi
-    done
-  done
-  [[ -n "$best_fam" && -n "$best_proto" ]] && echo "${best_fam}|${best_proto}" || echo ""
-}
-
-decide_best_combo_for_url_ul(){
-  local url="$1"
-  local fams=(); case "$IP_VERSION" in 4) fams=(4) ;; 6) fams=(6) ;; *) fams=(4 6) ;; esac
-  local protos=(); (( FORCE_HTTP1 )) && protos=("1.1") || protos=(2 "1.1")
-  local best_fam="" best_proto="" best_mbps=0 best_time=999999
-  for f in "${fams[@]}"; do
-    for p in "${protos[@]}"; do
-      local r; r=$(_probe_combo_ul "$url" "$f" "$p"); [[ "$r" =~ ^ok ]] || continue
-      local _ok _mbps _t _code _ver _tc; read -r _ok _mbps _t _code _ver _tc <<<"$r"
-      if [[ "$p" == "2" && "$_ver" != "2" ]]; then continue; fi
-      if [[ "$p" == "1.1" && "$_ver" != "1.1" ]]; then continue; fi
-      local better=0 diff; diff=$(awk -v a="$_mbps" -v b="$best_mbps" 'BEGIN{if(b==0)print 1; else if(a>=b*1.05)print 1; else print 0}')
-      if (( best_mbps == 0 )) || (( diff == 1 )); then better=1
-      else smaller=$(awk -v a="$_t" -v b="$best_time" 'BEGIN{print (a<b)?1:0}'); ((smaller==1)) && better=1; fi
-      if (( better==1 )); then best_fam="$f"; best_proto="$p"; best_mbps=${_mbps%.*}.${_mbps#*.}; best_time=${_t%.*}.${_t#*.}; fi
-    done
-  done
-  [[ -n "$best_fam" && -n "$best_proto" ]] && echo "${best_fam}|${best_proto}" || echo ""
-}
-
-# —— 单地址预检（下载） —— #
-preflight_single_download(){
-  local url="$1"
-  echo; echo "${C_BOLD}[预检-下载] 单地址连通性/速度测试${C_RESET}"
-  echo "目标：${C_BLUE}$url${C_RESET}"
-  local fams=(4 6); local protos=(2 "1.1"); (( FORCE_HTTP1 )) && protos=("1.1")
-  local v4_ok=0 v6_ok=0 v4_mbps=0 v6_mbps=0 v4_tconn=0 v6_tconn=0 v4_proto="" v6_proto=""
-  for f in "${fams[@]}"; do
-    local best_m=0 best_t=999999 best_conn=0 best_p=""
     for p in "${protos[@]}"; do
       local r; r=$(_probe_combo "$url" "$f" "$p")
-      local status mbps t code ver tconn; read -r status mbps t code ver tconn <<<"$r"
-      if [[ "$status" == "ok" ]]; then
-        if [[ "$p" == "2" && "$ver" != "2" ]]; then continue; fi
-        if [[ "$p" == "1.1" && "$ver" != "1.1" ]]; then continue; fi
-        local better=0 diff; diff=$(awk -v a="$mbps" -v b="$best_m" 'BEGIN{if(b==0)print 1; else if(a>=b*1.05)print 1; else print 0}')
-        if (( best_m==0 )) || (( diff==1 )); then better=1
-        else smaller=$(awk -v a="$t" -v b="$best_t" 'BEGIN{print (a<b)?1:0}'); ((smaller==1)) && better=1; fi
-        if (( better==1 )); then best_m="$mbps"; best_t="$t"; best_conn="$tconn"; best_p="$p"; fi
+      [[ "$r" =~ ^ok ]] || continue
+      local _ok _mbps _t _code _ver; read -r _ok _mbps _t _code _ver <<<"$r"
+      # 只接受真正按所选协议完成的（例如 --http2 但回落成1.1，则 _ver!=2）
+      if [[ "$p" == "2" && "$_ver" != "2" ]]; then continue; fi
+      if [[ "$p" == "1.1" && "$_ver" != "1.1" ]]; then continue; fi
+      # 选择规则：优先更高 MB/s；若相近(<=5%)，选耗时更少的
+      local better=0 diff; diff=$(awk -v a="$_mbps" -v b="$best_mbps" 'BEGIN{if(b==0)print 1; else if(a>=b*1.05)print 1; else print 0}')
+      if (( best_mbps == 0 )) || (( diff == 1 )); then better=1
+      else
+        # 速度差不多，选 time 更小
+        smaller=$(awk -v a="$_t" -v b="$best_time" 'BEGIN{print (a<b)?1:0}')
+        (( smaller==1 )) && better=1
       fi
+      if (( better==1 )); then best_fam="$f"; best_proto="$p"; best_mbps=${_mbps%.*}.${_mbps#*.}; best_time=${_t%.*}.${_t#*.}; fi
     done
-    if (( f==4 )); then (( $(awk -v x="$best_m" 'BEGIN{print (x>0)?1:0}') )) && v4_ok=1
-      v4_mbps="$best_m"; v4_tconn="$best_conn"; v4_proto="$best_p"
-    else (( $(awk -v x="$best_m" 'BEGIN{print (x>0)?1:0}') )) && v6_ok=1
-      v6_mbps="$best_m"; v6_tconn="$best_conn"; v6_proto="$best_p"
-    fi
   done
-  if (( v4_ok )); then
-    echo "IPv4：${C_GREEN}可用${C_RESET}  延迟: $(ms "$v4_tconn") ms  速度: $(printf '%.2f' "$v4_mbps") MB/s  协议: HTTP/${v4_proto}"
-  else echo "IPv4：${C_RED}不可用${C_RESET}"; fi
-  if (( v6_ok )); then
-    echo "IPv6：${C_GREEN}可用${C_RESET}  延迟: $(ms "$v6_tconn") ms  速度: $(printf '%.2f' "$v6_mbps") MB/s  协议: HTTP/${v6_proto}"
-  else echo "IPv6：${C_RED}不可用${C_RESET}"; fi
 
-  if (( v4_ok==0 && v6_ok==0 )); then echo "${C_RED}[!] v4/v6 都不可用，取消启动。${C_RESET}"; return 2; fi
-  local chosen="IPv4 / HTTP/$v4_proto"
-  local chosen_fam=4 chosen_proto="$v4_proto"
-  if (( v6_ok==1 )); then
-    local pick_v6; pick_v6=$(awk -v a="$v6_mbps" -v b="$v4_mbps" 'BEGIN{print (a>=b*1.05)?1:0}')
-    if (( pick_v6==1 )); then chosen="IPv6 / HTTP/$v6_proto"; chosen_fam=6; chosen_proto="$v6_proto"
-    else
-      local near; near=$(awk -v a="$v6_mbps" -v b="$v4_mbps" 'BEGIN{if(b==0)print 0; else print (a>=b*0.95 && a<=b*1.05)?1:0}')
-      if (( near==1 )); then
-        local v6_conn_ms; v6_conn_ms=$(ms "$v6_tconn"); local v4_conn_ms; v4_conn_ms=$(ms "$v4_tconn")
-        if (( $(awk -v a="$v6_conn_ms" -v b="$v4_conn_ms" 'BEGIN{print (a<b)?1:0}') )); then chosen="IPv6 / HTTP/$v6_proto"; chosen_fam=6; chosen_proto="$v6_proto"; fi
-      fi
-    fi
+  if [[ -n "$best_fam" && -n "$best_proto" ]]; then
+    echo "${best_fam}|${best_proto}"
+  else
+    echo ""
   fi
-  echo "${C_CYAN}将使用（下载）：${chosen}${C_RESET}"
-  read -rp "确认开始下载（回车继续 / 输入 n 取消）: " _ok || true
-  [[ "${_ok:-}" == "n" || "${_ok:-}" == "N" ]] && return 1
-  return 0
 }
 
-# —— 单地址预检（上传） —— #
-preflight_single_upload(){
-  local url="$1"
-  echo; echo "${C_BOLD}[预检-上传] 单地址连通性/速度测试${C_RESET}"
-  echo "目标：${C_BLUE}$url${C_RESET}"
-  local fams=(4 6); local protos=(2 "1.1"); (( FORCE_HTTP1 )) && protos=("1.1")
-  local v4_ok=0 v6_ok=0 v4_mbps=0 v6_mbps=0 v4_tconn=0 v6_tconn=0 v4_proto="" v6_proto=""
-  for f in "${fams[@]}"; do
-    local best_m=0 best_t=999999 best_conn=0 best_p=""
-    for p in "${protos[@]}"; do
-      local r; r=$(_probe_combo_ul "$url" "$f" "$p")
-      local status mbps t code ver tconn; read -r status mbps t code ver tconn <<<"$r"
-      if [[ "$status" == "ok" ]]; then
-        if [[ "$p" == "2" && "$ver" != "2" ]]; then continue; fi
-        if [[ "$p" == "1.1" && "$ver" != "1.1" ]]; then continue; fi
-        local better=0 diff; diff=$(awk -v a="$mbps" -v b="$best_m" 'BEGIN{if(b==0)print 1; else if(a>=b*1.05)print 1; else print 0}')
-        if (( best_m==0 )) || (( diff==1 )); then better=1
-        else smaller=$(awk -v a="$t" -v b="$best_t" 'BEGIN{print (a<b)?1:0}'); ((smaller==1)) && better=1; fi
-        if (( better==1 )); then best_m="$mbps"; best_t="$t"; best_conn="$tconn"; best_p="$p"; fi
-      fi
-    done
-    if (( f==4 )); then (( $(awk -v x="$best_m" 'BEGIN{print (x>0)?1:0}') )) && v4_ok=1
-      v4_mbps="$best_m"; v4_tconn="$best_conn"; v4_proto="$best_p"
-    else (( $(awk -v x="$best_m" 'BEGIN{print (x>0)?1:0}') )) && v6_ok=1
-      v6_mbps="$best_m"; v6_tconn="$best_conn"; v6_proto="$best_p"
-    fi
-  done
-  if (( v4_ok )); then
-    echo "IPv4：${C_GREEN}可用${C_RESET}  首连: $(ms "$v4_tconn") ms  上传速: $(printf '%.2f' "$v4_mbps") MB/s  协议: HTTP/${v4_proto}"
-  else echo "IPv4：${C_RED}不可用${C_RESET}"; fi
-  if (( v6_ok )); then
-    echo "IPv6：${C_GREEN}可用${C_RESET}  首连: $(ms "$v6_tconn") ms  上传速: $(printf '%.2f' "$v6_mbps") MB/s  协议: HTTP/${v6_proto}"
-  else echo "IPv6：${C_RED}不可用${C_RESET}"; fi
-
-  if (( v4_ok==0 && v6_ok==0 )); then echo "${C_RED}[!] v4/v6 都不可用，取消启动。${C_RESET}"; return 2; fi
-  echo "${C_CYAN}将使用（上传）：$(
-    if (( v6_ok && ($(awk -v a="$v6_mbps" -v b="$v4_mbps" 'BEGIN{print (a>=b)?1:0}')) )); then echo "IPv6 / HTTP/$v6_proto"; else echo "IPv4 / HTTP/$v4_proto"; fi
-  )${C_RESET}"
-  read -rp "确认开始上传（回车继续 / 输入 n 取消）: " _ok || true
-  [[ "${_ok:-}" == "n" || "${_ok:-}" == "N" ]] && return 1
-  return 0
-}
-
-# 黑名单/选择
 is_blacklisted_dl(){ local until="${BL_DL[$1]:-0}"; (( until>0 && $(now_ts) < until )); }
 is_blacklisted_ul(){ local until="${BL_UL[$1]:-0}"; (( until>0 && $(now_ts) < until )); }
 blacklist_dl(){ BL_DL["$1"]=$(( $(now_ts) + BLACKLIST_TTL )); }
@@ -434,14 +287,13 @@ pick_working_dl(){ # -> "url|fam|proto"
   done
   echo ""; return 1
 }
-
 pick_working_ul(){ # -> "url|fam|proto"
   local tries=${#ACTIVE_UPLOAD_URLS[@]}; ((tries==0))&&{ echo ""; return 1; }
   local i=0
   while (( i<tries )); do
     local cand="${ACTIVE_UPLOAD_URLS[RANDOM % ${#ACTIVE_UPLOAD_URLS[@]}]}"
     is_blacklisted_ul "$cand" && { ((i++)); continue; }
-    local choice; choice="$(decide_best_combo_for_url_ul "$cand")"
+    local choice; choice="$(decide_best_combo_for_url "$cand")"
     if [[ -z "$choice" ]]; then blacklist_ul "$cand"; ((i++)); continue; fi
     echo "${cand}|${choice}"; return 0
   done
@@ -465,23 +317,24 @@ download_worker(){
       sticky_url="${pair%|*}"; local rest="${pair#*|}"; sticky_family="${rest%|*}"; sticky_proto="${rest#*|}"
     fi
 
-    local final; final="$(add_cb "$sticky_url" "$id")"
+    local final="${sticky_url}?nocache=$(date +%s%N)-$id-$RANDOM"
     local limit_bps; limit_bps=$(calc_dl_thread_bps)
 
-    local bytes=0 secs=0 code="000" ver="0" res
+    local bytes=0 secs=0 code="000" ver=""; local res
     if (( ALWAYS_CHUNK )); then
       local range_end=$(( CHUNK_MB_DL*1048576 - 1 ))
       res="$(curl_measure_dl_range "$final" "$range_end" "$limit_bps" "$sticky_family" "$sticky_proto")"
-      read -r bytes secs code ver _tc <<<"${res:-"0 0 000 0 0"}"
+      read -r bytes secs code ver <<<"${res:-"0 0 000 0"}"
     else
       res="$(curl_measure_full "$final" "$limit_bps" "$sticky_family" "$sticky_proto")"
+      # size code time ver url
       if [[ -n "$res" ]]; then
         bytes="${res%% *}"; res="${res#* }"; code="${res%% *}"; res="${res#* }"; secs="${res%% *}"; res="${res#* }"; ver="${res%% *}"
       fi
       if [[ -z "$bytes" || "$bytes" == "0" || ( "$code" != "200" && "$code" != "206" ) ]]; then
         local range_end=$(( CHUNK_MB_DL*1048576 - 1 ))
         res="$(curl_measure_dl_range "$final" "$range_end" "$limit_bps" "$sticky_family" "$sticky_proto")"
-        read -r bytes secs code ver _tc <<<"${res:-"0 0 000 0 0"}"
+        read -r bytes secs code ver <<<"${res:-"0 0 000 0"}"
       fi
     fi
 
@@ -518,12 +371,11 @@ upload_worker(){
     (( END_TS>0 )) && (( $(date +%s) >= END_TS )) && break
     local pair; pair=$(pick_working_ul); if [[ -z "$pair" ]]; then sleep 3; continue; fi
     local url="${pair%|*}"; local rest="${pair#*|}"; local fam="${rest%|*}"; local proto="${rest#*|}"
-    local final; final="$(add_cb "$url" "$id")"
+    local final="${url}?nocache=$(date +%s%N)-$id-$RANDOM"
     local limit_bps; limit_bps=$(calc_ul_thread_bps)
     local chunk_bytes=$(( CHUNK_MB_UL*1048576 ))
     local res; res="$(curl_measure_upload "$final" "$chunk_bytes" "$limit_bps" "$fam" "$proto")"
-    local bytes=0 code="000" ver="0" tt=0 tc=0
-    [[ -n "$res" ]] && { read -r bytes code ver tt tc <<<"$res"; }
+    local bytes=0 code="000" ver="0"; [[ -n "$res" ]] && { bytes="${res%% *}"; res="${res#* }"; code="${res%% *}"; ver="${res##* }"; }
     if [[ "$code" != "200" && "$code" != "204" && "$code" != "201" && "$code" != "202" ]]; then
       bytes=0; blacklist_ul "$url"; sleep 1
     fi
@@ -643,36 +495,12 @@ interactive_start(){
   elif [[ "$t" =~ ^[0-9]+$ ]] && (( t>0 )); then total_threads="$t"
   else echo "${C_YELLOW}[!] 非法输入，使用自动选择。${C_RESET}"; total_threads=$(auto_threads); fi
 
-  if [[ "$MODE" != "u" ]]; then
-    list_download_urls
-    read -rp "下载地址（输入 编号或URL，可混填，逗号分隔；留空=全量）: " pick_dl || true
-    parse_mixed_selection "${pick_dl:-}" URLS ACTIVE_URLS
-  else
-    ACTIVE_URLS=()
-  fi
+  if [[ "$MODE" != "u" ]]; then list_download_urls; read -rp "下载地址编号（逗号分隔，留空=全量）: " pick_dl || true; parse_choice_to_array "${pick_dl:-}" URLS ACTIVE_URLS
+  else ACTIVE_URLS=(); fi
 
-  if [[ "$MODE" != "d" ]]; then
-    list_upload_urls
-    read -rp "上传地址（输入 编号或URL，可混填，逗号分隔；留空=仅 Cloudflare）: " pick_ul || true
-    if [[ -z "${pick_ul// /}" ]]; then
-      ACTIVE_UPLOAD_URLS=( "${UPLOAD_URLS[0]}" )
-      echo "[*] 默认仅使用 ${UPLOAD_URLS[0]}"
-    else
-      parse_mixed_selection "${pick_ul:-}" UPLOAD_URLS ACTIVE_UPLOAD_URLS
-    fi
-  else
-    ACTIVE_UPLOAD_URLS=()
-  fi
-
-  # —— 单地址预检（下载/上传各自恰好 1 个时触发）——
-  if [[ "$MODE" != "u" ]] && (( ${#ACTIVE_URLS[@]} == 1 )); then
-    preflight_single_download "${ACTIVE_URLS[0]}" || { [[ $? -eq 2 ]] && echo "${C_YELLOW}建议：更换下载地址或稍后再试。${C_RESET}"; return; }
-  fi
-  if [[ "$MODE" != "d" ]] && (( ${#ACTIVE_UPLOAD_URLS[@]} == 1 )); then
-    if [[ "${ACTIVE_UPLOAD_URLS[0]}" != "${UPLOAD_URLS[0]}" ]]; then
-      preflight_single_upload "${ACTIVE_UPLOAD_URLS[0]}" || { [[ $? -eq 2 ]] && echo "${C_YELLOW}建议：更换上传地址或稍后再试。${C_RESET}"; return; }
-    fi
-  fi
+  if [[ "$MODE" != "d" ]]; then list_upload_urls; read -rp "上传地址编号（逗号分隔，留空=仅 Cloudflare）: " pick_ul || true
+    if [[ -z "${pick_ul// /}" ]]; then ACTIVE_UPLOAD_URLS=( "${UPLOAD_URLS[0]}" ); echo "[*] 默认仅使用 ${UPLOAD_URLS[0]}"; else parse_choice_to_array "${pick_ul:-}" UPLOAD_URLS ACTIVE_UPLOAD_URLS; fi
+  else ACTIVE_UPLOAD_URLS=(); fi
 
   read -rp "运行多久（小时，留空=一直）: " hours || true
   if [[ -z "${hours// /}" ]]; then END_TS=0; echo "[*] 将一直运行，直到手动停止。"
@@ -709,8 +537,9 @@ configure_limits(){
 }
 
 configure_cpu_limit_mode(){
-  local lm_text="关闭"; case "$LIMIT_MODE" in 1) lm_text="恒定50%";; 2) lm_text="5min@90% / 10min@50%";; esac
-  echo "${C_BOLD}限制模式：${C_RESET}当前 = ${lm_text}"
+  echo "${C_BOLD}限制模式：${C_RESET}当前 = $(
+    case "$LIMIT_MODE" in 0) echo "关闭" ;; 1) echo "恒定50%" ;; 2) echo "5min@90% / 10min@50%" ;; esac
+  )"
   echo "  1) 限制到 50%"; echo "  2) 5 分钟 90%，10 分钟 50%，循环"; echo "  3) 清除限制"
   read -rp "选择 [1-3]: " lm || true
   case "${lm:-}" in 1) limit_set_mode 1 ;; 2) limit_set_mode 2 ;; 3) limit_set_mode 0 ;; *) echo "${C_YELLOW}无效选择，未更改。${C_RESET}" ;; esac
