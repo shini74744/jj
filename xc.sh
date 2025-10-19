@@ -2,6 +2,10 @@
 # 流量消耗/测速脚本（彩色菜单 + 实时统计 + 定时汇总 + 仅脚本限速 + CPU限制
 # + 健康检查 + 黏住好链接 + IPv4/IPv6 自动选择 + HTTP/2/HTTP/1 自动选择
 # + 单地址预检（下载/上传）：当仅选 1 个地址时，预先展示 v4/v6 连通性、延迟与速度，确认后再执行）
+# 更新要点：
+# - 下载/上传地址输入支持“编号 或 直接粘贴 URL”（可混填、逗号分隔）
+# - 单地址预检：下载单地址必预检；上传若为默认CF地址则跳过预检（否则预检）
+# - 其它逻辑维持：自动 v4/v6 + HTTP/2↔1.1 择优、健康检查/拉黑、黏住好链接 等
 
 set -Euo pipefail
 
@@ -137,11 +141,28 @@ show_status(){
   echo "${C_BOLD}└────────────────────────────────────────────────────────┘${C_RESET}"
 }
 
-parse_choice_to_array(){
-  local input="$1" src="$2" dst="$3"; local -n _SRC="$src"; local -n _DST="$dst"; _DST=()
-  [[ -z "${input// /}" ]]&&{ _DST=("${_SRC[@]}"); return; }
-  IFS=',' read -r -a idxs <<<"$input"
-  for raw in "${idxs[@]}"; do local n="${raw//[[:space:]]/}"; [[ "$n" =~ ^[0-9]+$ ]]||continue; (( n>=1 && n<=${#_SRC[@]} ))||continue; _DST+=("${_SRC[$((n-1))]}"); done
+#############################
+# 输入解析：编号 或 直接URL（可混填）
+#############################
+parse_mixed_selection(){
+  local input="$1" src="$2" dst="$3"
+  local -n _SRC="$src"; local -n _DST="$dst"; _DST=()
+  # 空输入：使用全量源列表
+  [[ -z "${input// /}" ]] && { _DST=("${_SRC[@]}"); return; }
+  IFS=',' read -r -a items <<<"$input"
+  for raw in "${items[@]}"; do
+    local tok="${raw#"${raw%%[![:space:]]*}"}"; tok="${tok%"${tok##*[![:space:]]}"}"  # trim
+    [[ -z "$tok" ]] && continue
+    if [[ "$tok" =~ ^https?:// ]]; then
+      _DST+=("$tok")
+    elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+      local n="$tok"; (( n>=1 && n<=${#_SRC[@]} )) && _DST+=("${_SRC[$((n-1))]}")
+    else
+      # 忽略无法识别的 token
+      :
+    fi
+  done
+  # 若非空输入但无有效项，回退为全量
   [[ ${#_DST[@]} -gt 0 ]] || _DST=("${_SRC[@]}")
 }
 
@@ -624,23 +645,34 @@ interactive_start(){
 
   if [[ "$MODE" != "u" ]]; then
     list_download_urls
-    read -rp "下载地址编号（逗号分隔，留空=全量）: " pick_dl || true
-    parse_choice_to_array "${pick_dl:-}" URLS ACTIVE_URLS
-  else ACTIVE_URLS=(); fi
+    read -rp "下载地址（输入 编号或URL，可混填，逗号分隔；留空=全量）: " pick_dl || true
+    parse_mixed_selection "${pick_dl:-}" URLS ACTIVE_URLS
+  else
+    ACTIVE_URLS=()
+  fi
 
   if [[ "$MODE" != "d" ]]; then
     list_upload_urls
-    read -rp "上传地址编号（逗号分隔，留空=仅 Cloudflare）: " pick_ul || true
-    if [[ -z "${pick_ul// /}" ]]; then ACTIVE_UPLOAD_URLS=( "${UPLOAD_URLS[0]}" ); echo "[*] 默认仅使用 ${UPLOAD_URLS[0]}"
-    else parse_choice_to_array "${pick_ul:-}" UPLOAD_URLS ACTIVE_UPLOAD_URLS; fi
-  else ACTIVE_UPLOAD_URLS=(); fi
+    read -rp "上传地址（输入 编号或URL，可混填，逗号分隔；留空=仅 Cloudflare）: " pick_ul || true
+    if [[ -z "${pick_ul// /}" ]]; then
+      ACTIVE_UPLOAD_URLS=( "${UPLOAD_URLS[0]}" )
+      echo "[*] 默认仅使用 ${UPLOAD_URLS[0]}"
+    else
+      parse_mixed_selection "${pick_ul:-}" UPLOAD_URLS ACTIVE_UPLOAD_URLS
+    fi
+  else
+    ACTIVE_UPLOAD_URLS=()
+  fi
 
   # —— 单地址预检（下载/上传各自恰好 1 个时触发）——
   if [[ "$MODE" != "u" ]] && (( ${#ACTIVE_URLS[@]} == 1 )); then
     preflight_single_download "${ACTIVE_URLS[0]}" || { [[ $? -eq 2 ]] && echo "${C_YELLOW}建议：更换下载地址或稍后再试。${C_RESET}"; return; }
   fi
   if [[ "$MODE" != "d" ]] && (( ${#ACTIVE_UPLOAD_URLS[@]} == 1 )); then
-    preflight_single_upload "${ACTIVE_UPLOAD_URLS[0]}" || { [[ $? -eq 2 ]] && echo "${C_YELLOW}建议：更换上传地址或稍后再试。${C_RESET}"; return; }
+    # 如果是默认CF上传地址，则跳过预检
+    if [[ "${ACTIVE_UPLOAD_URLS[0]}" != "${UPLOAD_URLS[0]}" ]]; then
+      preflight_single_upload "${ACTIVE_UPLOAD_URLS[0]}" || { [[ $? -eq 2 ]] && echo "${C_YELLOW}建议：更换上传地址或稍后再试。${C_RESET}"; return; }
+    fi
   fi
 
   read -rp "运行多久（小时，留空=一直）: " hours || true
