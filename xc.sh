@@ -189,9 +189,26 @@ parse_choice_to_array() {
 # 统计相关
 #############################
 init_counters() {
-  COUNTER_DIR="$(mktemp -d -t vpsburn.XXXXXX)"
-  DL_TOTAL_FILE="$COUNTER_DIR/dl.total"; echo 0 > "$DL_TOTAL_FILE"
-  UL_TOTAL_FILE="$COUNTER_DIR/ul.total"; echo 0 > "$UL_TOTAL_FILE"
+  # 优先使用 $TMPDIR，其次 /dev/shm、/var/tmp、当前目录
+  local bases=()
+  [[ -n "${TMPDIR:-}" ]] && bases+=("$TMPDIR")
+  bases+=("/dev/shm" "/var/tmp" ".")
+
+  COUNTER_DIR=""
+  for base in "${bases[@]}"; do
+    if [[ -d "$base" && -w "$base" ]]; then
+      COUNTER_DIR="$(mktemp -d -p "$base" vpsburn.XXXXXX 2>/dev/null)" || true
+      [[ -n "$COUNTER_DIR" ]] && break
+    fi
+  done
+
+  if [[ -z "$COUNTER_DIR" ]]; then
+    echo "${C_RED}[-] 无法创建临时目录：/tmp 可能已满。请设置 TMPDIR=/var/tmp 或清理磁盘后重试。${C_RESET}"
+    return 1
+  fi
+
+  DL_TOTAL_FILE="$COUNTER_DIR/dl.total"; echo 0 > "$DL_TOTAL_FILE" || return 1
+  UL_TOTAL_FILE="$COUNTER_DIR/ul.total"; echo 0 > "$UL_TOTAL_FILE" || return 1
 }
 cleanup_counters() { [[ -n "$COUNTER_DIR" ]] && rm -rf "$COUNTER_DIR" 2>/dev/null || true; }
 
@@ -560,7 +577,7 @@ smart_split_threads() {
 start_consumption() {
   local mode="$1" dl_n="$2" ul_n="$3"
   [[ "$mode" =~ ^(d|u|b)$ ]] || { echo "[-] 内部错误：mode 无效"; return 1; }
-  init_and_check || { echo "${C_RED}无法启动：缺少 curl。${C_RESET}"; return 1; }
+  init_and_check || { echo "${C_RED}无法启动：初始化失败（可能 /tmp 无空间或未安装 curl）。${C_RESET}"; return 1; }
   MODE="$mode"; PIDS=()
 
   echo "${C_BOLD}[*] $(human_now) 启动：模式=${MODE}  下载线程=${dl_n}  上传线程=${ul_n}${C_RESET}"
@@ -669,7 +686,7 @@ interactive_start() {
     END_TS=0; echo "[*] 将一直运行，直到手动停止。"
   elif [[ "$hours" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     local secs; secs=$(awk -v h="$hours" 'BEGIN{printf "%.0f", h*3600}')
-    END_TS=$(( $(date +%s) + secs )); echo "[*] 预计运行 ${hours} 次，至 $(date -d @"$END_TS" "+%F %T") 停止。"
+    END_TS=$(( $(date +%s) + secs )); echo "[*] 预计运行 ${hours} 小时，至 $(date -d @"$END_TS" "+%F %T") 停止。"
   else
     echo "${C_YELLOW}[!] 非法输入，改为一直运行。${C_RESET}"; END_TS=0
   fi
