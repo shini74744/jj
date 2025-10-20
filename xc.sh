@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # 流量消耗/测速脚本（数字模式 + 彩色菜单 + 实时统计 + 定时汇总 + 仅脚本限速 + 强力清理）
 # 变更：分块分离(CHUNK_MB_DL/UL)、默认仅CF上行(留空时)、智能分配线程（偶数均分/奇数自动偏向更受限的一方或默认给上传）
-# 新增：菜单 2「限制模式（CPU）」：1) 恒定 50%  2) 5min@90% / 10min@50%  3) 清除；
-#       在菜单 2 设置后，对菜单 1 的“开始消耗”自动生效；运行中切换也会即时生效。
+# 新增：菜单 2「限制模式（CPU）」：
+#      1) 恒定 50%
+#      2) 模拟正常使用（随机波动/偶发短突发/夜间低负载）
+#      3) 清除
+# 说明：2 模式将替换原来的“5min@90% / 10min@50%”，以更贴近“人类/业务”日常使用形态并降低被风控命中的概率。
 
 # 注意：移除了 -e（出错即退出），避免在 cgroup/cpulimit 不可用时直接退回 shell
 set -Euo pipefail
+
+# =================== cgroup 周期（更平滑） ===================
+# cgroup v2 配额周期（微秒），默认 20000=20ms；范围建议 1000–100000
+CGROUP_PERIOD_US=${CGROUP_PERIOD_US:-20000}
+# ============================================================
 
 #############################
 # 可自定义默认值 / 首选项
@@ -95,11 +103,11 @@ UL_TOTAL_FILE=""
 DL_LIMIT_MB=0
 UL_LIMIT_MB=0
 
-## ===== CPU 限制相关（新增） =====
-LIMIT_MODE=0              # 0=无, 1=恒定50%, 2=5min@90%/10min@50%
+## ===== CPU 限制相关 =====
+LIMIT_MODE=0              # 0=无, 1=恒定50%, 2=模拟正常使用（随机/偶发突发/夜间低负载）
 LIMIT_METHOD=""           # "cgroup" | "cpulimit" | "none"
 CGROUP_DIR=""             # cgroup v2 路径
-LIMITER_PID=              # 周期限速调度器 PID（mode=2）
+LIMITER_PID=              # 调度器 PID（mode=2）
 CPULIMIT_WATCHERS=()      # cpulimit 进程 PID 数组
 
 #############################
@@ -159,7 +167,7 @@ show_status() {
        case "$LIMIT_MODE" in
          0) echo "关闭" ;;
          1) echo "恒定 50%" ;;
-         2) echo "5min@90% / 10min@50%" ;;
+         2) echo "模拟正常使用" ;;
        esac
      )" \
     "$(
@@ -400,7 +408,7 @@ kill_tree_once() {
 }
 
 #############################
-# CPU 限制实现（新增，带容错）
+# CPU 限制实现
 #############################
 cores_count() {
   if command -v nproc >/dev/null 2>&1; then nproc; else echo 1; fi
@@ -424,10 +432,16 @@ kill_cpulimit_watchers() {
     CPULIMIT_WATCHERS=()
   fi
 }
-# cgroup 路径准备 & 进入本脚本进程（子进程会继承）
+
+# 进入 cgroup（确保 +cpu）
 cgroup_enter_self() {
   set +e
   [[ "$LIMIT_METHOD" != "cgroup" ]] && { set -e; return 0; }
+  if [[ -w /sys/fs/cgroup/cgroup.subtree_control ]]; then
+    if ! grep -qw cpu /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; then
+      echo +cpu > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+    fi
+  fi
   if [[ -z "$CGROUP_DIR" ]]; then
     CGROUP_DIR="/sys/fs/cgroup/vpsburn.$$"
     mkdir -p "$CGROUP_DIR" 2>/dev/null || true
@@ -435,13 +449,14 @@ cgroup_enter_self() {
   [[ -w "$CGROUP_DIR/cgroup.procs" ]] && echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
   set -e
 }
-# 按总 CPU 百分比设置限额（多核按总和计算）
+
+# 设置 cgroup 百分比（短周期，减少瞬时越线）
 cgroup_set_percent() {
   set +e
   local pct="$1"
   [[ "$LIMIT_METHOD" != "cgroup" ]] && { set -e; return 0; }
   [[ -z "$CGROUP_DIR" ]] && { set -e; return 0; }
-  local period=100000
+  local period=${CGROUP_PERIOD_US}
   if (( pct <= 0 || pct >= 100 )); then
     echo "max" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
     set -e; return 0
@@ -451,6 +466,7 @@ cgroup_set_percent() {
   echo "$quota $period" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
   set -e
 }
+
 # cpulimit 附着到当前工作线程
 cpulimit_apply_for_pids() {
   local pct="$1"
@@ -462,7 +478,21 @@ cpulimit_apply_for_pids() {
     CPULIMIT_WATCHERS+=("$!")
   done
 }
-# 统一入口：设置瞬时限额（cpulimit: pct>=100 则直接清除监控）
+
+# 全局% → 每进程 cpulimit% 的换算（更贴近全局目标）
+calc_cpulimit_per_proc() {
+  local target_pct="$1"                # 全局目标，例如 50
+  local ncores; ncores=$(cores_count)  # 逻辑核数
+  local nprocs=${#PIDS[@]}            # 受控进程个数
+  (( nprocs < 1 )) && nprocs=1
+  awk -v tp="$target_pct" -v nc="$ncores" -v np="$nprocs" 'BEGIN{
+    v = tp * nc / np;
+    if (v < 1) v = 1; if (v > 100) v = 100;
+    printf "%.0f", v
+  }'
+}
+
+# 统一入口：设置瞬时限额
 limit_apply_percent() {
   set +e
   local pct="$1"
@@ -475,7 +505,8 @@ limit_apply_percent() {
       if (( pct >= 100 )); then
         kill_cpulimit_watchers
       else
-        cpulimit_apply_for_pids "$pct"
+        local per; per=$(calc_cpulimit_per_proc "$pct")
+        cpulimit_apply_for_pids "$per"
       fi
       ;;
     *)
@@ -484,15 +515,58 @@ limit_apply_percent() {
   esac
   set -e
 }
-# 周期限速调度器（5min@90% → 10min@50%）
-limit_scheduler() {
+
+# =========== 新增：模拟“正常使用”的自适应调度器（替换原模式 2） ===========
+# 行为特征：
+# - 白天（08–19）：10–35% 为主，20% 概率出现 40–65% 的短突发（10–45s）
+# - 晚间（19–24, 06–08）：6–25% 为主，10% 概率出现 30–50% 的短突发
+# - 夜间（01–06）：3–12% 为主，5% 概率出现 20–30% 小突发
+# - 时长：常态窗口 30–180s 随机；突发窗口 10–45s 随机
+# - 偶尔“休息”窗口（每 6–10 个周期）：2–5% 负载维持 5–15s
+rand_between() { # 整数 [min,max]
+  local min="$1" max="$2"
+  echo $(( RANDOM % (max - min + 1) + min ))
+}
+normal_usage_scheduler() {
+  local cycle=0
   while true; do
-    limit_apply_percent 90; sleep 300
-    limit_apply_percent 50; sleep 600
+    cycle=$((cycle+1))
+    local hour; hour=$(date +%H)
+    local base_min base_max burst_p burst_min burst_max
+    if (( 8<=10#$hour && 10#$hour<19 )); then
+      base_min=10; base_max=35; burst_p=20; burst_min=40; burst_max=65
+    elif (( 1<=10#$hour && 10#$hour<6 )); then
+      base_min=3;  base_max=12; burst_p=5;  burst_min=20; burst_max=30
+    else
+      base_min=6;  base_max=25; burst_p=10; burst_min=30; burst_max=50
+    fi
+    local target dur
+    # 每 6–10 个周期插入一个“休息”：2–5% for 5–15s
+    if (( cycle % $(rand_between 6 10) == 0 )); then
+      target=$(rand_between 2 5)
+      dur=$(rand_between 5 15)
+      limit_apply_percent "$target"; sleep "$dur"
+      continue
+    fi
+    # 是否突发
+    if (( RANDOM % 100 < burst_p )); then
+      target=$(rand_between "$burst_min" "$burst_max")
+      dur=$(rand_between 10 45)
+    else
+      target=$(rand_between "$base_min" "$base_max")
+      dur=$(rand_between 30 180)
+    fi
+    # 上下限保护（极端情况下）
+    (( target < 1 )) && target=1
+    (( target > 90 )) && target=90
+    limit_apply_percent "$target"
+    sleep "$dur"
   done
 }
-start_limit_scheduler() { is_scheduler_running || { limit_scheduler & LIMITER_PID=$!; echo "${C_GREEN}[*] 周期限速已启用：5min@90% / 10min@50%。${C_RESET}"; }; }
-stop_limit_scheduler() { kill_scheduler; }
+start_normal_usage() { is_scheduler_running || { normal_usage_scheduler & LIMITER_PID=$!; echo "${C_GREEN}[*] 已启用：模拟正常使用（随机/突发/夜间低负载）。${C_RESET}"; }; }
+stop_normal_usage() { kill_scheduler; }
+# ============================================================================
+
 # 模式切换
 limit_set_mode() {
   set +e
@@ -501,14 +575,14 @@ limit_set_mode() {
   case "$mode" in
     0)
       LIMIT_MODE=0
-      stop_limit_scheduler
+      stop_normal_usage
       kill_cpulimit_watchers
       limit_apply_percent 100
       echo "${C_GREEN}[+] 已清除 CPU 限制。${C_RESET}"
       ;;
     1)
       LIMIT_MODE=1
-      stop_limit_scheduler
+      stop_normal_usage
       [[ "$LIMIT_METHOD" == "cgroup" ]] && cgroup_enter_self
       limit_apply_percent 50
       echo "${C_GREEN}[+] 已设置恒定 50% CPU 限制。${C_RESET}"
@@ -516,20 +590,24 @@ limit_set_mode() {
     2)
       LIMIT_MODE=2
       [[ "$LIMIT_METHOD" == "cgroup" ]] && cgroup_enter_self
-      start_limit_scheduler
+      start_normal_usage
       ;;
   esac
   set -e
 }
+
 ensure_limit_on_current_run() {
   (( LIMIT_MODE==0 )) && return 0
   detect_limit_method
   if [[ "$LIMIT_METHOD" == "cgroup" ]]; then
     if (( LIMIT_MODE==1 )); then limit_apply_percent 50; fi
-    if (( LIMIT_MODE==2 )); then start_limit_scheduler; fi
+    if (( LIMIT_MODE==2 )); then start_normal_usage; fi
   elif [[ "$LIMIT_METHOD" == "cpulimit" ]]; then
-    if (( LIMIT_MODE==1 )); then cpulimit_apply_for_pids 50; fi
-    if (( LIMIT_MODE==2 )); then start_limit_scheduler; fi
+    if (( LIMIT_MODE==1 )); then
+      local per; per=$(calc_cpulimit_per_proc 50)
+      cpulimit_apply_for_pids "$per"
+    fi
+    if (( LIMIT_MODE==2 )); then start_normal_usage; fi
   fi
 }
 
@@ -619,7 +697,7 @@ stop_consumption() {
     done
     PIDS=()
   fi
-  # 停掉 cpulimit watchers（周期调度器保留，以便后续启动仍自动生效）
+  # 停掉 cpulimit watchers（调度器保留，以便后续启动仍自动生效）
   kill_cpulimit_watchers
   stop_summary
   local dl_g=0 ul_g=0
@@ -763,18 +841,18 @@ configure_limits() {
 }
 
 #############################
-# 限制模式菜单（新增）
+# 限制模式菜单（2 = 模拟正常使用）
 #############################
 configure_cpu_limit_mode() {
   echo "${C_BOLD}限制模式（CPU）：${C_RESET}当前 = $(
     case "$LIMIT_MODE" in
       0) echo "关闭" ;;
       1) echo "恒定 50%" ;;
-      2) echo "周期 5min@90% / 10min@50%" ;;
+      2) echo "模拟正常使用" ;;
     esac
   )"
   echo "  1) 限制到 50% 以下（恒定）"
-  echo "  2) 5 分钟 90%，10 分钟 50%，循环"
+  echo "  2) 模拟正常使用（随机波动/偶发短突发/夜间低负载）"
   echo "  3) 清除限制"
   read -rp "选择 [1-3]: " lm || true
   case "${lm:-}" in
@@ -783,13 +861,15 @@ configure_cpu_limit_mode() {
     3) limit_set_mode 0 ;;
     *) echo "${C_YELLOW}无效选择，未更改。${C_RESET}" ;;
   esac
-  echo "${C_DIM}说明：优先使用 cgroup v2（需可写 /sys/fs/cgroup），否则回退到 cpulimit。若均不可用，将仅提示无法精确限速。${C_RESET}"
+  echo "${C_DIM}说明：优先使用 cgroup v2（需可写 /sys/fs/cgroup），否则回退到 cpulimit；模拟模式将周期性随机调整 CPU 目标，包含短突发与休息窗口，以更贴近日常使用。${C_RESET}"
 }
 
 #############################
 # Trap / 菜单
 #############################
 trap 'echo; echo "${C_YELLOW}[!] 捕获到信号，正在清理…${C_RESET}"; stop_consumption; exit 0' INT TERM
+# 尝试清理我们创建的 cgroup 目录（不影响其它功能）
+trap '[[ -n "${CGROUP_DIR:-}" ]] && rmdir "$CGROUP_DIR" 2>/dev/null || true' EXIT
 
 menu() {
   while true; do
@@ -798,7 +878,7 @@ menu() {
     show_status
     echo "${C_BOLD}├──────────────────────────────── 菜 单 ─────────────────────────┤${C_RESET}"
     echo "  1) 开始消耗（交互式：上传/下载/同时、线程、地址、时长）"
-    echo "  2) 限制模式（CPU：50% / 5min@90%→10min@50% / 清除）"
+    echo "  2) 限制模式（CPU：恒定50% / 模拟正常使用 / 清除）"
     echo "  3) 停止全部线程（显示最终汇总）"
     echo "  4) 查看地址池（下载/上传）"
     echo "  5) 设置/关闭定时汇总（每 N 秒）"
