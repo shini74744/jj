@@ -117,9 +117,7 @@ URLS=(
 
 UPLOAD_URLS=(
   "https://speed.cloudflare.com/__up"
-  "https://httpbin.org/post"
-  "https://nghttp2.org/httpbin/post"
-  "https://postman-echo.com/post"
+  "https://fancy-feather-6ba1.7474483.workers.dev/"
 )
 
 #############################
