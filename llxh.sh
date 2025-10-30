@@ -105,9 +105,6 @@ URLS=(
 # 上传地址池（默认：全量随机）
 UPLOAD_URLS=(
   "https://speed.cloudflare.com/__up"
-  "https://httpbin.org/post"
-  "https://nghttp2.org/httpbin/post"
-  "https://postman-echo.com/post"
 )
 
 #############################
