@@ -608,7 +608,7 @@ watchdog_loop() {
     for id in "${!UL_PIDS[@]}"; do
       local hb="$COUNTER_DIR/hb.ul.$id" pid="${UL_PIDS[$id]:-}"
       [[ -z "$pid" || -z "$hb" ]] && continue
-      if kill -0 "$pid" 2:/dev/null; then
+      if kill -0 "$pid" 2>/dev/null; then
         local mt=0; [[ -f "$hb" ]] && mt=$(stat -c %Y "$hb" 2>/dev/null || stat -f %m "$hb" 2>/dev/null || echo 0)
         if (( mt>0 && now-mt > WATCHDOG_STALL )); then
           if (( WATCHDOG_MAX_RESTARTS==0 || ${UL_RESTARTS[$id]:-0} < WATCHDOG_MAX_RESTARTS )); then
