@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# 流量消耗/测速脚本（分块/仅脚本限速/CPU行为模拟/熔断与看门狗/定时汇总/强力清理/美化UI）
-# - 主菜单为纯文本 ASCII，避免乱码
-# - 行输出：固定列宽（本次/累计/速率/URL 全量显示，数字带颜色）
-# - 停滞/超时杀手、端点熔断、线程看门狗、IPv4/IPv6 自动探测
-# - Ctrl+C / SIGHUP（SSH断开）都能完整清理并退出
+# 流量消耗/测速脚本（分块/限速仅本脚本/CPU行为模拟/熔断+看门狗/定时汇总/强清理/ASCII菜单）
+# - 运行中不再自动回到菜单；可用热键：m=打开菜单，3=停止，q/0=退出，Ctrl+C=退出
+# - 行输出固定列：数字彩色、URL完整显示；IPv4/IPv6自动探测；SSH断开也清理
 
 set -Euo pipefail
 
@@ -42,12 +40,16 @@ WATCHDOG_INTERVAL=${WATCHDOG_INTERVAL:-5}
 WATCHDOG_STALL=${WATCHDOG_STALL:-20}
 WATCHDOG_MAX_RESTARTS=${WATCHDOG_MAX_RESTARTS:-0} # 0=不限制；>0=每线程最大重启数
 
-# 颜色/样式
+# 颜色/样式（tput 或 ANSI 回退）
 init_colors() {
   if command -v tput >/dev/null 2>&1 && [[ -t 1 ]] && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; then
     C_RESET="$(tput sgr0)"; C_BOLD="$(tput bold)"; C_DIM="$(tput dim)"
     C_RED="$(tput setaf 1)"; C_GREEN="$(tput setaf 2)"; C_YELLOW="$(tput setaf 3)"
     C_BLUE="$(tput setaf 4)"; C_MAGENTA="$(tput setaf 5)"; C_CYAN="$(tput setaf 6)"; C_WHITE="$(tput setaf 7)"
+  elif [[ -t 1 ]]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'; C_MAGENTA=$'\033[35m'; C_CYAN=$'\033[36m'; C_WHITE=$'\033[37m'
   else
     C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""; C_WHITE=""
   fi
@@ -122,7 +124,6 @@ UL_LIMIT_MB=0
 
 # 线程PID映射 & 心跳 & 重启计数
 declare -A DL_PIDS UL_PIDS
-declare -A DL_HB UL_HB
 declare -A DL_RESTARTS UL_RESTARTS
 
 ## ===== CPU 限制相关 =====
@@ -132,9 +133,8 @@ CGROUP_DIR=""             # cgroup v2 路径
 LIMITER_PID=              # 调度器 PID（mode=2）
 CPULIMIT_WATCHERS=()      # cpulimit PID
 NONE_WARNED=0
-
-# 显式跟踪看门狗 PID
 WATCHDOG_PID=
+ANNOUNCED_KEYS=0          # 运行中热键提示仅显示一次
 
 #############################
 # 熔断/冷却（下载&上传共用）
@@ -166,9 +166,8 @@ pick_active_ul_url() {
 #############################
 # UI 辅助
 #############################
-term_cols() { command -v tput >/dev/null 2>&1 && tput cols || echo 80; }
+term_cols() { command -v tput >/dev/null 2>&1 && tput cols || echo 120; }  # 给宽一点，避免换行频繁
 repeat_char() { local n="$1" ch="${2:-─}"; printf "%*s" "$n" "" | tr ' ' "$ch"; }
-truncate_middle() { local s="$1" w="$2" n keep; n=${#s}; (( n<=w )) && { printf "%s" "$s"; return; }; (( w<5 )) && { printf "%.*s" "$w" "$s"; return; }; keep=$(( (w-3)/2 )); printf "%.*s...%s" "$keep" "$s" "${s: -$keep}"; }
 
 #############################
 # 工具函数
@@ -176,7 +175,7 @@ truncate_middle() { local s="$1" w="$2" n keep; n=${#s}; (( n<=w )) && { printf 
 human_now() { date "+%F %T"; }
 date_human_ts() {
   if date -d @0 +%F >/dev/null 2>&1; then date -d @"$1" "+%F %T"
-  elif date -r 0 +%F >/dev止 2>&1; then date -r "$1" "+%F %T"
+  elif date -r 0 +%F >/dev/null 2>&1; then date -r "$1" "+%F %T"
   else echo "$1"; fi
 }
 auto_threads() {
@@ -347,35 +346,31 @@ curl_measure_upload() {
 }
 
 #############################
-# 行打印（固定列宽，数字上色，URL全量）
+# 行打印（固定列宽，数字上色，URL完整显示）
 #############################
 print_dl_status() {
   local tid="$1" url="$2" bytes="$3" tsum="$4" sec="${5:-0}"
-  local global_bytes; global_bytes=$(atomic_add "$DL_TOTAL_FILE" "$bytes")
+  local _; _=$(atomic_add "$DL_TOTAL_FILE" "$bytes") # 更新全局计数
   : > "$COUNTER_DIR/hb.dl.$tid"
-  local cols; cols=$(term_cols); (( cols<80 )) && cols=80
-  local urlw=$(( cols - 64 )); (( urlw<20 )) && urlw=20
   local rate; rate=$(fmt_rate "$bytes" "$sec")
   printf "%s[DL#%s]%s | 本次 %s%6.2f MB%s | 累计 %s%7.2f MB%s | 速率 %s%6s MB/s%s | %s\n" \
     "${C_CYAN}" "$tid" "${C_RESET}" \
     "${C_YELLOW}" "$(fmt_mb "$bytes")" "${C_RESET}" \
     "${C_GREEN}"  "$(fmt_mb "$tsum")"  "${C_RESET}" \
     "${C_MAGENTA}" "$rate"            "${C_RESET}" \
-    "$(truncate_middle "$url" "$urlw")"
+    "$url"
 }
 print_ul_status() {
   local tid="$1" url="$2" bytes="$3" tsum="$4" sec="${5:-0}"
-  local global_bytes; global_bytes=$(atomic_add "$UL_TOTAL_FILE" "$bytes")
+  local _; _=$(atomic_add "$UL_TOTAL_FILE" "$bytes")
   : > "$COUNTER_DIR/hb.ul.$tid"
-  local cols; cols=$(term_cols); (( cols<80 )) && cols=80
-  local urlw=$(( cols - 64 )); (( urlw<20 )) && urlw=20
   local rate; rate=$(fmt_rate "$bytes" "$sec")
   printf "%s[UL#%s]%s | 本次 %s%6.2f MB%s | 累计 %s%7.2f MB%s | 速率 %s%6s MB/s%s | %s\n" \
     "${C_MAGENTA}" "$tid" "${C_RESET}" \
     "${C_YELLOW}" "$(fmt_mb "$bytes")" "${C_RESET}" \
     "${C_GREEN}"  "$(fmt_mb "$tsum")"  "${C_RESET}" \
     "${C_CYAN}"   "$rate"             "${C_RESET}" \
-    "$(truncate_middle "$url" "$urlw")"
+    "$url"
 }
 
 #############################
@@ -453,7 +448,6 @@ limit_apply_percent() {
         local per; per=$(calc_cpulimit_per_proc "$pct"); cpulimit_apply_for_pids "$per"
       fi ;;
     *)
-      # 清理阶段把 CPU 恢复为 100% 时静默；其他情况仅提示一次
       if (( pct < 100 )) && (( NONE_WARNED == 0 )); then
         echo "${C_YELLOW}[!] 无 cgroup写权限且未安装 cpulimit，无法精确限 CPU（仅提示一次）。${C_RESET}"
         NONE_WARNED=1
@@ -672,11 +666,7 @@ start_consumption() {
   MODE="$mode"; PIDS=(); DL_PIDS=(); UL_PIDS=(); DL_RESTARTS=(); UL_RESTARTS=()
 
   echo "${C_BOLD}[*] $(human_now) 启动：模式=${MODE}  下载线程=${dl_n}  上传线程=${ul_n}${C_RESET}"
-  if (( SUMMARY_INTERVAL>0 )); then
-    echo "[*] 定时汇总：每 ${SUMMARY_INTERVAL}s"
-  else
-    echo "[*] 定时汇总：关闭"
-  fi
+  if (( SUMMARY_INTERVAL>0 )); then echo "[*] 定时汇总：每 ${SUMMARY_INTERVAL}s"; else echo "[*] 定时汇总：关闭"; fi
   (( END_TS > 0 )) && echo "[*] 预计停止于：$(date_human_ts "$END_TS")"
 
   if (( LIMIT_MODE>0 )); then detect_limit_method; [[ "$LIMIT_METHOD" == "cgroup" ]] && cgroup_enter_self; fi
@@ -691,7 +681,8 @@ start_consumption() {
   start_summary
   if (( WATCHDOG_ENABLE==1 )); then watchdog_loop & WATCHDOG_PID=$!; fi
 
-  echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 或选菜单 3 可停止。${C_RESET}"
+  echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 退出；按 m 打开菜单；按 3 停止。${C_RESET}"
+  ANNOUNCED_KEYS=1
   wait_first_output
   ensure_limit_on_current_run
 }
@@ -708,9 +699,7 @@ stop_consumption() {
 
   echo "${C_BOLD}[*] $(human_now) 正在停止全部线程…${C_RESET}"
 
-  if ! is_running; then
-    : # 没有运行中线程
-  else
+  if is_running; then
     for pid in "${PIDS[@]}"; do
       safe_pkill_children TERM "$pid"; kill -TERM "$pid" 2>/dev/null || true
     done
@@ -821,7 +810,7 @@ configure_cpu_limit_mode() {
 }
 
 #############################
-# Trap / 菜单
+# Trap / 菜单（运行中不自动回到菜单，热键监听）
 #############################
 on_signal() {
   echo "${C_YELLOW}[!] 捕获到信号，正在清理…${C_RESET}"
@@ -832,20 +821,46 @@ trap on_signal INT TERM HUP
 trap '[[ -n "${CGROUP_DIR:-}" ]] && rmdir "$CGROUP_DIR" 2>/dev/null || true' EXIT
 
 menu() {
+  local c key
   while true; do
-    echo
-    show_status
-    read -rp "${C_BOLD}请选择 [0-6] > ${C_RESET}" c || true
-    case "${c:-}" in
-      1) interactive_start        ;;
-      2) configure_cpu_limit_mode ;;
-      3) stop_consumption         ;;
-      4) show_urls                ;;
-      5) configure_summary        ;;
-      6) configure_limits         ;;
-      0) on_signal                ;;
-      *) echo "${C_YELLOW}无效选择。${C_RESET}" ;;
-    esac
+    if ! is_running; then
+      echo
+      show_status
+      read -rp "${C_BOLD}请选择 [0-6] > ${C_RESET}" c || true
+      case "${c:-}" in
+        1) interactive_start        ;;
+        2) configure_cpu_limit_mode ;;
+        3) stop_consumption         ;;
+        4) show_urls                ;;
+        5) configure_summary        ;;
+        6) configure_limits         ;;
+        0|q|Q) on_signal            ;;
+        *) echo "${C_YELLOW}无效选择。${C_RESET}" ;;
+      esac
+    else
+      # 运行中：不自动显示菜单。监听单键热键。
+      read -rsn1 -t 86400 key || continue
+      case "${key:-}" in
+        m|M)
+          echo
+          show_status
+          read -rp "${C_BOLD}请选择 [0-6] > ${C_RESET}" c || true
+          case "${c:-}" in
+            1) interactive_start        ;;
+            2) configure_cpu_limit_mode ;;
+            3) stop_consumption         ;;
+            4) show_urls                ;;
+            5) configure_summary        ;;
+            6) configure_limits         ;;
+            0|q|Q) on_signal            ;;
+            *) : ;;
+          esac
+          ;;
+        3) stop_consumption ;;
+        0|q|Q) on_signal ;;
+        *) : ;; # 其他键忽略
+      esac
+    fi
   done
 }
 
