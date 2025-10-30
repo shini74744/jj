@@ -42,7 +42,7 @@ WATCHDOG_INTERVAL=${WATCHDOG_INTERVAL:-5}     # 每 N 秒巡检
 WATCHDOG_STALL=${WATCHDOG_STALL:-20}          # 心跳超过 N 秒未更新，视为卡死
 WATCHDOG_MAX_RESTARTS=${WATCHDOG_MAX_RESTARTS:-0} # 0=不限制；>0=每线程最大重启数
 
-# 品牌信息（可通过环境变量覆盖）
+# 品牌信息
 AUTHOR=${AUTHOR:-"大大怪"}
 PROBE_ADDR=${PROBE_ADDR:-"nmsl.ma"}
 
@@ -66,7 +66,7 @@ CURL_IP_OPT=(); HTTP_VER_OPT=()
 case "$IP_VERSION" in
   4) CURL_IP_OPT+=(-4);;
   6) CURL_IP_OPT+=(-6);;
-  0) : ;; # 自动后面探测
+  0) : ;;
 esac
 (( FORCE_HTTP1 )) && HTTP_VER_OPT+=(--http1.1)
 
@@ -82,7 +82,7 @@ auto_pick_ip_version() {
 auto_pick_ip_version
 
 #############################
-# 目标地址池（已去重，按你要求）
+# 目标地址池（按你的清单）
 #############################
 URLS=(
   "https://nbg1-speed.hetzner.com/100MB.bin"
@@ -94,7 +94,7 @@ URLS=(
   "https://ash-speed.hetzner.com/100MB.bin"
   "https://ash-speed.hetzner.com/1GB.bin"
   "https://hil-speed.hetzner.com/100MB.bin"
-  "https://hil1-speed.hetzner.com/1GB.bin"
+  "https://hil-speed.hetzner.com/1GB.bin"
   "https://sin-speed.hetzner.com/100MB.bin"
   "https://sin-speed.hetzner.com/1GB.bin"
   "https://speed.cloudflare.com/__down?bytes=104857600"
@@ -102,7 +102,7 @@ URLS=(
   "https://store.storevideos.cdn-apple.com/v1/store.apple.com/st/1666383693478/atvloop-video-202210/streams_atvloop-video-202210/1920x1080/fileSequence3.m4s"
 )
 
-# 上传地址池（HTTP 直传；默认=全量随机）
+# 上传地址池（默认：全量随机）
 UPLOAD_URLS=(
   "https://speed.cloudflare.com/__up"
   "https://httpbin.org/post"
@@ -133,18 +133,17 @@ declare -A DL_HB UL_HB
 declare -A DL_RESTARTS UL_RESTARTS
 
 ## ===== CPU 限制相关 =====
-LIMIT_MODE=0              # 0=无, 1=恒定50%, 2=模拟正常使用
-LIMIT_METHOD=""           # "cgroup" | "cpulimit" | "none"
-CGROUP_DIR=""             # cgroup v2 路径
-LIMITER_PID=              # 调度器 PID（mode=2）
-CPULIMIT_WATCHERS=()      # cpulimit PID
+LIMIT_MODE=0
+LIMIT_METHOD=""
+CGROUP_DIR=""
+LIMITER_PID=
+CPULIMIT_WATCHERS=()
 NONE_WARNED=0
 
-# 显式跟踪看门狗 PID
 WATCHDOG_PID=
 
 #############################
-# 熔断/冷却（下载&上传共用）
+# 熔断/冷却
 #############################
 declare -A URL_FAILS URL_COOLDOWN
 now_epoch() { date +%s; }
@@ -152,7 +151,7 @@ url_on_cooldown() { local u="$1" now; now=$(now_epoch); local until="${URL_COOLD
 mark_url_fail() {
   local u="$1" fails=$(( ${URL_FAILS[$u]:-0} + 1 ))
   URL_FAILS[$u]=$fails
-  local cd=$(( 5 * fails ))            # 线性回退：5s,10s,15s...
+  local cd=$(( 5 * fails ))
   URL_COOLDOWN[$u]=$(( $(now_epoch) + cd ))
 }
 mark_url_ok() { local u="$1"; URL_FAILS[$u]=0; URL_COOLDOWN[$u]=0; }
@@ -261,8 +260,8 @@ show_status() {
   echo "$line"
   printf "运行状态 : %s\n" "$( is_running && echo '运行中' || echo '未运行' )"
   printf "当前模式 : %s\n" "${MODE:-N/A}"
-  printf "作者     : %s\n" "$AUTHOR"
-  printf "探针地址 : %s\n" "$PROBE_ADDR"
+  printf "作者     : %s%s%s\n" "${C_RED}" "$AUTHOR" "${C_RESET}"
+  printf "探针地址 : %s%s%s\n" "${C_RED}" "$PROBE_ADDR" "${C_RESET}"
   printf "线程数   : DL=%s / UL=%s\n" "${DL_THREADS:-0}" "${UL_THREADS:-0}"
   printf "定时汇总 : %s\n" "$summary_text"
   printf "下载总计 : %s MB\n" "$(bytes_to_mb "$dl_g")"
@@ -295,7 +294,7 @@ calc_ul_thread_bps() {
 }
 
 #############################
-# curl 封装（输出 size 与 time_total，便于算速率）
+# curl 封装
 #############################
 curl_measure_dl_range() {
   local url="$1" range_end="$2" limit_bps="${3:-0}"
@@ -369,7 +368,7 @@ print_ul_status() {
 }
 
 #############################
-# 清理辅助（强力，兼容无 pkill）
+# 清理辅助
 #############################
 safe_pkill_children() {
   local sig="$1" ppid="$2"
@@ -437,8 +436,11 @@ limit_apply_percent() {
   case "$LIMIT_METHOD" in
     cgroup)  cgroup_set_percent "$pct" ;;
     cpulimit)
-      if (( pct >= 100 )); then kill_cpulimit_watchERS=false; kill_cpulimit_watchers
-      else local per; per=$(calc_cpulimit_per_proc "$pct"); cpulimit_apply_for_pids "$per"; fi ;;
+      if (( pct >= 100 )); then
+        kill_cpulimit_watchers
+      else
+        local per; per=$(calc_cpulimit_per_proc "$pct"); cpulimit_apply_for_pids "$per"
+      fi ;;
     *)
       if (( SUPPRESS_WARN_ON_EXIT==0 )); then
         (( NONE_WARNED==0 )) && { echo "${C_YELLOW}[!] 无 cgroup写权限且未安装 cpulimit，无法精确限 CPU（仅提示一次）。${C_RESET}"; NONE_WARNED=1; }
@@ -493,7 +495,7 @@ ensure_limit_on_current_run() {
 }
 
 #############################
-# 线程启动/重启（看门狗用）
+# 线程启动/重启
 #############################
 spawn_dl() { local id="$1"; download_worker "$id" & local pid=$!; DL_PIDS["$id"]=$pid; PIDS+=("$pid"); }
 spawn_ul() { local id="$1"; upload_worker "$id" & local pid=$!; UL_PIDS["$id"]=$pid; PIDS+=("$pid"); }
@@ -564,7 +566,6 @@ start_summary() {
 stop_summary() {
   if is_summary_running; then kill -TERM "$SUMMARY_PID" 2>/dev/null || true; wait "$SUMMARY_PID" 2>/dev/null || true; SUMMARY_PID=; echo "${C_GREEN}[+] 已停止定时汇总。${C_RESET}"; fi
 }
-# 交互设置定时汇总（与菜单项 5 对应）
 configure_summary() {
   echo "当前定时汇总：$([[ $SUMMARY_INTERVAL -gt 0 ]] && echo \"每 ${SUMMARY_INTERVAL}s\" || echo '关闭')"
   read -rp "输入间隔秒（0=关闭，留空不变）: " v || true
@@ -607,7 +608,7 @@ watchdog_loop() {
     for id in "${!UL_PIDS[@]}"; do
       local hb="$COUNTER_DIR/hb.ul.$id" pid="${UL_PIDS[$id]:-}"
       [[ -z "$pid" || -z "$hb" ]] && continue
-      if kill -0 "$pid" 2>/dev/null; then
+      if kill -0 "$pid" 2:/dev/null; then
         local mt=0; [[ -f "$hb" ]] && mt=$(stat -c %Y "$hb" 2>/dev/null || stat -f %m "$hb" 2>/dev/null || echo 0)
         if (( mt>0 && now-mt > WATCHDOG_STALL )); then
           if (( WATCHDOG_MAX_RESTARTS==0 || ${UL_RESTARTS[$id]:-0} < WATCHDOG_MAX_RESTARTS )); then
@@ -658,7 +659,7 @@ start_consumption() {
   MODE="$mode"; PIDS=(); DL_PIDS=(); UL_PIDS=(); DL_RESTARTS=(); UL_RESTARTS=()
 
   echo "${C_BOLD}[*] $(human_now) 启动：模式=${MODE}  下载线程=${dl_n}  上传线程=${ul_n}${C_RESET}"
-  echo "${C_DIM}[*] 作者: ${C_WHITE}${AUTHOR}${C_RESET}${C_DIM} | 探针: ${C_WHITE}${PROBE_ADDR}${C_RESET}"
+  echo "${C_DIM}[*] 作者: ${C_RED}${AUTHOR}${C_RESET}${C_DIM} | 探针: ${C_RED}${PROBE_ADDR}${C_RESET}"
   echo "[*] 定时汇总：$( ((SUMMARY_INTERVAL>0)) && echo "每 ${SUMMARY_INTERVAL}s" || echo "关闭" )"
   (( END_TS > 0 )) && echo "[*] 预计停止于：$(date_human_ts "$END_TS")"
 
@@ -680,7 +681,6 @@ start_consumption() {
 }
 
 stop_consumption() {
-  # 安静退出：不再打印“无 cgroup/cpulimit”的提示
   SUPPRESS_WARN_ON_EXIT=1
 
   if [[ -n "${WATCHDOG_PID:-}" ]] && kill -0 "$WATCHDOG_PID" 2>/dev/null; then
@@ -692,7 +692,6 @@ stop_consumption() {
   limit_apply_percent 100
 
   if ! is_running; then
-    # 即便无运行线程，也输出与期望一致的提示序列
     echo "[*] $(human_now) 正在停止全部线程…"
   else
     echo "[*] $(human_now) 正在停止全部线程…"
@@ -717,7 +716,7 @@ stop_consumption() {
 }
 
 #############################
-# 交互：启动（默认=3 同时）
+# 交互：启动（默认=3 同时）——启动后不再返回菜单
 #############################
 list_download_urls() { echo; echo "${C_BOLD}下载地址（共 ${#URLS[@]} 个）：${C_RESET}"; local i=0; for u in "${URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done; }
 list_upload_urls() { echo; echo "${C_BOLD}上传地址（共 ${#UPLOAD_URLS[@]} 个）：${C_RESET}"; local i=0; for u in "${UPLOAD_URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done; }
@@ -758,6 +757,13 @@ interactive_start() {
   else DL_THREADS=0; UL_THREADS="$total_threads"; fi
 
   start_consumption "$MODE" "$DL_THREADS" "$UL_THREADS"
+
+  # 关键：启动后阻塞等待，不再返回菜单；Ctrl+C/HUP 由 trap 处理并退出
+  if [[ -n "${WATCHDOG_PID:-}" ]]; then
+    wait "$WATCHDOG_PID" 2>/dev/null || true
+  else
+    while true; do sleep 3600; done
+  fi
 }
 
 #############################
@@ -828,7 +834,7 @@ menu() {
     show_status
     read -rp "${C_BOLD}请选择 [0-6] > ${C_RESET}" c || true
     case "${c:-}" in
-      1) interactive_start        ;;
+      1) interactive_start        ;;  # 启动后将阻塞直到退出
       2) configure_cpu_limit_mode ;;
       3) stop_consumption         ;;
       4) show_urls                ;;
