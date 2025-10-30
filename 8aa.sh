@@ -235,13 +235,10 @@ fmt_mb()   { awk -v b="$1" 'BEGIN{printf "%.2f", b/1048576}'; }
 fmt_rate() { local bytes="$1" sec="$2"; awk -v b="$bytes" -v s="$sec" 'BEGIN{ if(s<=0.000001){print "—"} else printf "%.2f", (b/1048576)/s }'; }
 
 #############################
-# UI：状态栏（保留美化） + 主菜单（去美化）
+# UI：状态栏（ASCII） + 主菜单（ASCII）
 #############################
 show_status() {
-  local cols; cols=$(term_cols)
-  (( cols<70 )) && cols=70
-  local title="流量消耗/测速 工具"
-  local line; line="$(repeat_char "$cols" "─")"
+  local cols; cols=$(term_cols); (( cols<70 )) && cols=70
 
   local dl_g=0 ul_g=0
   [[ -f "$DL_TOTAL_FILE" ]] && dl_g=$(cat "$DL_TOTAL_FILE")
@@ -251,34 +248,26 @@ show_status() {
   (( DL_LIMIT_MB>0 && DL_THREADS>0 )) && dl_thr=$(awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
   (( UL_LIMIT_MB>0 && UL_THREADS>0 )) && ul_thr=$(awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
 
-  # —— 状态栏（保留方框线） ——
-  echo "${C_BOLD}┌${line}┐${C_RESET}"
-  printf "│%s│\n" "$(center_text "${C_BOLD}${title}${C_RESET}" "$cols")"
-  echo "├$(repeat_char "$cols" "─")┤"
+  local line; line="$(repeat_char "$cols" "-")"
+  local summary_text; if (( SUMMARY_INTERVAL>0 )); then summary_text="每 ${SUMMARY_INTERVAL}s"; else summary_text="关闭"; fi
+  local end_text; if (( END_TS>0 )); then end_text="$(date_human_ts "$END_TS")"; else end_text="手动停止"; fi
+  local cpu_text; case "$LIMIT_MODE" in 0) cpu_text="关闭";; 1) cpu_text="恒定50%";; 2) cpu_text="模拟正常使用";; esac
 
-  local L1="运行: $(is_running && echo "${C_GREEN}运行中${C_RESET}" || echo "${C_YELLOW}未运行${C_RESET}")"
-  local L2="模式: ${MODE:-N/A}"
-  local L3="线程: DL=${DL_THREADS:-0} / UL=${UL_THREADS:-0}"
-  local L4="汇总: $( ((SUMMARY_INTERVAL>0)) && echo "每 ${SUMMARY_INTERVAL}s" || echo "关闭")"
+  echo "${C_BOLD}=== 流量消耗/测速 工具 ===${C_RESET}"
+  echo "$line"
+  printf "运行状态 : %s\n" "$( is_running && echo '运行中' || echo '未运行' )"
+  printf "当前模式 : %s\n" "${MODE:-N/A}"
+  printf "线程数   : DL=%s / UL=%s\n" "${DL_THREADS:-0}" "${UL_THREADS:-0}"
+  printf "定时汇总 : %s\n" "$summary_text"
+  printf "下载总计 : %s MB\n" "$(bytes_to_mb "$dl_g")"
+  printf "上传总计 : %s MB\n" "$(bytes_to_mb "$ul_g")"
+  printf "限速(总) : DL=%s / UL=%s MB/s\n" "${DL_LIMIT_MB}" "${UL_LIMIT_MB}"
+  printf "每线程≈  : DL=%s / UL=%s MB/s\n" "${dl_thr}" "${ul_thr}"
+  printf "结束时间 : %s\n" "$end_text"
+  printf "CPU限制  : %s (方法: %s)\n" "$cpu_text" "${LIMIT_METHOD:-"-"}"
+  echo "$line"
 
-  local R1="下载: $(bytes_to_mb "$dl_g") MB"
-  local R2="上传: $(bytes_to_mb "$ul_g") MB"
-  local R3="限速(总): DL=${DL_LIMIT_MB} / UL=${UL_LIMIT_MB} MB/s"
-  local R4="每线程≈ DL=${dl_thr} / UL=${ul_thr} MB/s"
-  local R5="结束: $( ((END_TS>0)) && date_human_ts "$END_TS" || echo "手动停止")"
-  local R6="限制模式: $(case "$LIMIT_MODE" in 0) echo 关闭;;1) echo 恒定50%;;2) echo 模拟正常使用;; esac)（方法: ${LIMIT_METHOD:-"-"}）"
-
-  local colW=$(( (cols-3)/2 ))
-  printf "│ %s │ %s │\n" "$(rpad "$L1" "$colW")" "$(rpad "$R1" "$colW")"
-  printf "│ %s │ %s │\n" "$(rpad "$L2" "$colW")" "$(rpad "$R2" "$colW")"
-  printf "│ %s │ %s │\n" "$(rpad "$L3" "$colW")" "$(rpad "$R3" "$colW")"
-  printf "│ %s │ %s │\n" "$(rpad "$L4" "$colW")" "$(rpad "$R4" "$colW")"
-  printf "│ %s │ %s │\n" "$(rpad "" "$colW")"  "$(rpad "$R5" "$colW")"
-  printf "│ %s │ %s │\n" "$(rpad "" "$colW")"  "$(rpad "$R6" "$colW")"
-  echo "├$(repeat_char "$cols" "─")┤"
-
-  # —— 主菜单（去美化，纯文本，避免乱码） ——
-  echo "${C_BOLD}菜 单${C_RESET}"
+  echo "菜单："
   echo "  1) 开始（交互式：上下行/线程/地址/时长）"
   echo "  2) 限制模式：1=恒定50% / 2=模拟 / 3=清除"
   echo "  3) 停止全部线程（显示最终汇总）"
@@ -286,7 +275,7 @@ show_status() {
   echo "  5) 定时汇总（每 N 秒）"
   echo "  6) 限速设置（仅脚本生效）"
   echo "  0) 退出"
-  echo "$(repeat_char "$cols" "-")"
+  echo "$line"
 }
 
 #############################
@@ -815,7 +804,7 @@ menu() {
   while true; do
     echo
     show_status
-    read -rp "${C_BOLD}请选择 [0-6] ▶ ${C_RESET}" c || true
+    read -rp "${C_BOLD}请选择 [0-6] > ${C_RESET}" c || true
     case "${c:-}" in
       1) interactive_start        ;;
       2) configure_cpu_limit_mode ;;
