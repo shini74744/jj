@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
 # 流量消耗/测速脚本（分块/仅脚本限速/CPU行为模拟/熔断与看门狗/定时汇总/强力清理/纯文本菜单）
-# 退出/中断（Ctrl+C/TERM/EXIT）时提示格式：
-# [!] 捕获到信号，正在清理…
-# [*] YYYY-MM-DD HH:MM:SS 正在停止全部线程…
-# [*] 最终汇总：下载总计 X.XX MB；上传总计 Y.YY MB
-# [+] 已全部停止。
 
 set -Euo pipefail
-
 CGROUP_PERIOD_US=${CGROUP_PERIOD_US:-20000}
 
-# ================== 可定制参数 ==================
+# ========= 可定制参数 =========
 DEFAULT_THREADS=${DEFAULT_THREADS:-6}
 SUMMARY_INTERVAL=${SUMMARY_INTERVAL:-0}
 
@@ -34,7 +28,7 @@ WATCHDOG_INTERVAL=${WATCHDOG_INTERVAL:-5}
 WATCHDOG_STALL=${WATCHDOG_STALL:-20}
 WATCHDOG_MAX_RESTARTS=${WATCHDOG_MAX_RESTARTS:-0}
 
-# ================ 颜色 ================
+# ========= 颜色 =========
 init_colors() {
   if command -v tput >/dev/null 2>&1 && [[ -t 1 ]] && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; then
     C_RESET="$(tput sgr0)"; C_BOLD="$(tput bold)"; C_DIM="$(tput dim)"
@@ -46,7 +40,7 @@ init_colors() {
 }
 init_colors
 
-# ================ IP/HTTP 选项 ================
+# ========= IP/HTTP 选项 =========
 CURL_IP_OPT=(); HTTP_VER_OPT=()
 case "${IP_VERSION}" in 4) CURL_IP_OPT+=(-4);; 6) CURL_IP_OPT+=(-6);; 0) :;; esac
 (( FORCE_HTTP1 )) && HTTP_VER_OPT+=(--http1.1)
@@ -61,7 +55,7 @@ auto_pick_ip_version() {
 }
 auto_pick_ip_version
 
-# ================ 下载/上传地址池（按你指定） ================
+# ========= 地址池 =========
 URLS=(
   "https://nbg1-speed.hetzner.com/100MB.bin"
   "https://nbg1-speed.hetzner.com/1GB.bin"
@@ -86,7 +80,7 @@ UPLOAD_URLS=(
   "https://postman-echo.com/post"
 )
 
-# ================ 运行期状态 ================
+# ========= 运行期状态 =========
 PIDS=()
 SUMMARY_PID=
 END_TS=0
@@ -104,8 +98,8 @@ UL_LIMIT_MB=0
 declare -A DL_PIDS UL_PIDS
 declare -A DL_RESTARTS UL_RESTARTS
 
-LIMIT_MODE=0          # 0=无, 1=恒定50%, 2=模拟
-LIMIT_METHOD=""       # cgroup|cpulimit|none
+LIMIT_MODE=0
+LIMIT_METHOD=""
 CGROUP_DIR=""
 LIMITER_PID=
 CPULIMIT_WATCHERS=()
@@ -114,16 +108,32 @@ NONE_WARNED=0
 WATCHDOG_PID=
 CLEANING=0
 STOPPED=0
-QUIET_SHUTDOWN=0      # 清理阶段静默多余提示
+QUIET_SHUTDOWN=0
 
-# ================ 熔断/冷却 ================
+# ========= 熔断/冷却 =========
 declare -A URL_FAILS URL_COOLDOWN
 now_epoch() { date +%s; }
 url_on_cooldown() { local u="$1" now; now=$(now_epoch); local until="${URL_COOLDOWN[$u]:-0}"; (( now < until )); }
 mark_url_fail() { local u="$1" fails=$(( ${URL_FAILS[$u]:-0} + 1 )); URL_FAILS[$u]=$fails; URL_COOLDOWN[$u]=$(( $(now_epoch) + 5 * fails )); }
 mark_url_ok() { local u="$1"; URL_FAILS[$u]=0; URL_COOLDOWN[$u]=0; }
 
-# ================ UI 辅助 ================
+# ✅ 这两个就是你运行时报错缺失的函数
+pick_active_dl_url() {
+  local candidates=() u
+  ((${#ACTIVE_URLS[@]}==0)) && ACTIVE_URLS=("${URLS[@]}")
+  for u in "${ACTIVE_URLS[@]}"; do url_on_cooldown "$u" || candidates+=("$u"); done
+  ((${#candidates[@]}==0)) && candidates=("${ACTIVE_URLS[@]}")
+  echo "${candidates[RANDOM % ${#candidates[@]}]}"
+}
+pick_active_ul_url() {
+  local candidates=() u
+  ((${#ACTIVE_UPLOAD_URLS[@]}==0)) && ACTIVE_UPLOAD_URLS=("${UPLOAD_URLS[0]}") # 默认仅 CF
+  for u in "${ACTIVE_UPLOAD_URLS[@]}"; do url_on_cooldown "$u" || candidates+=("$u"); done
+  ((${#candidates[@]}==0)) && candidates=("${ACTIVE_UPLOAD_URLS[@]}")
+  echo "${candidates[RANDOM % ${#candidates[@]}]}"
+}
+
+# ========= UI / 工具 =========
 term_cols() { command -v tput >/dev/null 2>&1 && tput cols || echo 80; }
 repeat_char() { local n="$1" ch="${2:-─}"; printf "%*s" "$n" "" | tr ' ' "$ch"; }
 
@@ -148,17 +158,25 @@ bytes_to_mb() { awk -v b="$1" 'BEGIN{printf "%.2f", b/1048576}'; }
 fmt_mb()   { awk -v b="$1" 'BEGIN{printf "%.2f", b/1048576}'; }
 fmt_rate() { local bytes="$1" sec="$2"; awk -v b="$bytes" -v s="$sec" 'BEGIN{ if(s<=0.000001){print "—"} else printf "%.2f", (b/1048576)/s }'; }
 
-# ================ 状态/菜单（文本） ================
+# 原子累加，避免并发竞争
+atomic_add() {
+  local file="$1" add="$2"
+  if command -v flock >/dev/null 2>&1; then
+    ( exec 9<>"${file}.lock"; flock -x 9; local cur=0; [[ -f "$file" ]] && cur=$(cat "$file" 2>/dev/null || echo 0); echo $((cur + add)) > "$file"; cat "$file" )
+  else
+    local cur=0; [[ -f "$file" ]] && cur=$(cat "$file" 2>/dev/null || echo 0); echo $((cur + add)) > "$file"; cat "$file"
+  fi
+}
+
+# ========= 状态/菜单 =========
 show_status() {
   local cols; cols=$(term_cols); (( cols<70 )) && cols=70
   local dl_g=0 ul_g=0
   [[ -f "$DL_TOTAL_FILE" ]] && dl_g=$(cat "$DL_TOTAL_FILE")
   [[ -f "$UL_TOTAL_FILE" ]] && ul_g=$(cat "$UL_TOTAL_FILE")
-
   local dl_thr="-" ul_thr="-"
   (( DL_LIMIT_MB>0 && DL_THREADS>0 )) && dl_thr=$(awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
   (( UL_LIMIT_MB>0 && UL_THREADS>0 )) && ul_thr=$(awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
-
   local line; line="$(repeat_char "$cols" "-")"
   local summary_text; if (( SUMMARY_INTERVAL>0 )); then summary_text="每 ${SUMMARY_INTERVAL}s"; else summary_text="关闭"; fi
   local end_text; if (( END_TS>0 )); then end_text="$(date_human_ts "$END_TS")"; else end_text="手动停止"; fi
@@ -189,33 +207,26 @@ show_status() {
   echo "$line"
 }
 
-calc_dl_thread_bps() {
-  if (( DL_LIMIT_MB > 0 && DL_THREADS > 0 )); then awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{v=mb*1048576/n; if(v<1) v=1; printf "%.0f", v}'; else echo 0; fi
-}
-calc_ul_thread_bps() {
-  if (( UL_LIMIT_MB > 0 && UL_THREADS > 0 )); then awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{v=mb*1048576/n; if(v<1) v=1; printf "%.0f", v}'; else echo 0; fi
-}
+calc_dl_thread_bps() { if (( DL_LIMIT_MB > 0 && DL_THREADS > 0 )); then awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{v=mb*1048576/n; if(v<1) v=1; printf "%.0f", v}'; else echo 0; fi; }
+calc_ul_thread_bps() { if (( UL_LIMIT_MB > 0 && UL_THREADS > 0 )); then awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{v=mb*1048576/n; if(v<1) v=1; printf "%.0f", v}'; else echo 0; fi; }
 
-# ================ curl 封装 ================
+# ========= curl 封装 =========
 curl_measure_dl_range() {
   local url="$1" range_end="$2" limit_bps="${3:-0}"
   local extra=(); (( limit_bps > 0 )) && extra+=(--limit-rate "$limit_bps")
-  curl -sS -L \
-    "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
+  curl -sS -L "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
     --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
     --retry 2 --retry-all-errors \
     --speed-time "$CURL_SPEED_TIME" --speed-limit "$CURL_SPEED_LIMIT" \
     -A "Mozilla/5.0" -H "Range: bytes=0-${range_end}" \
-    "${extra[@]}" \
-    -w '%{size_download} %{time_total}' \
+    "${extra[@]}" -w '%{size_download} %{time_total}' \
     -o /dev/null "$url" 2>/dev/null || true
 }
 curl_measure_full() {
   local url="$1" limit_bps="${2:-0}"
   local extra=(); (( limit_bps > 0 )) && extra+=(--limit-rate "$limit_bps")
   local max_bytes=$((128*1024*1024))
-  curl -sS -L \
-    "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
+  curl -sS -L "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
     --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
     --retry 3 --retry-delay 1 --retry-all-errors \
     --speed-time "$CURL_SPEED_TIME" --speed-limit "$CURL_SPEED_LIMIT" \
@@ -228,19 +239,17 @@ curl_measure_upload() {
   local url="$1" bytes="$2" limit_bps="${3:-0}"
   local extra=(); (( limit_bps > 0 )) && extra+=(--limit-rate "$limit_bps")
   head -c "$bytes" /dev/zero | \
-    curl -sS -L \
-      "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
+    curl -sS -L "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
       --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
       --retry 2 --retry-all-errors \
       --speed-time "$CURL_SPEED_TIME" --speed-limit "$CURL_SPEED_LIMIT" \
       -A "Mozilla/5.0" -H "Content-Type: application/octet-stream" \
-      "${extra[@]}" \
-      --data-binary @- \
+      "${extra[@]}" --data-binary @- \
       -w '%{size_upload} %{time_total} %{http_code}' \
       -o /dev/null -X POST "$url" 2>/dev/null || true
 }
 
-# ================ 行打印（数字上色，URL完整显示） ================
+# ========= 行打印（数字上色，URL完整） =========
 print_dl_status() {
   local tid="$1" url="$2" bytes="$3" tsum="$4" sec="${5:-0}"
   : > "$COUNTER_DIR/hb.dl.$tid"
@@ -251,11 +260,7 @@ print_dl_status() {
     "${C_CYAN}" "$(fmt_mb "$tsum")"  "${C_RESET}" \
     "${C_CYAN}" "$rate"               "${C_RESET}" \
     "${C_BLUE}" "$url"                "${C_RESET}"
-  # 全局累计
-  if [[ -f "$DL_TOTAL_FILE" ]]; then
-    local cur=$(cat "$DL_TOTAL_FILE" 2>/dev/null || echo 0)
-    echo $((cur + bytes)) > "$DL_TOTAL_FILE"
-  fi
+  [[ -f "$DL_TOTAL_FILE" ]] && atomic_add "$DL_TOTAL_FILE" "$bytes" >/dev/null
 }
 print_ul_status() {
   local tid="$1" url="$2" bytes="$3" tsum="$4" sec="${5:-0}"
@@ -267,13 +272,10 @@ print_ul_status() {
     "${C_MAGENTA}" "$(fmt_mb "$tsum")"  "${C_RESET}" \
     "${C_MAGENTA}" "$rate"              "${C_RESET}" \
     "${C_BLUE}" "$url"                  "${C_RESET}"
-  if [[ -f "$UL_TOTAL_FILE" ]]; then
-    local cur=$(cat "$UL_TOTAL_FILE" 2>/dev/null || echo 0)
-    echo $((cur + bytes)) > "$UL_TOTAL_FILE"
-  fi
+  [[ -f "$UL_TOTAL_FILE" ]] && atomic_add "$UL_TOTAL_FILE" "$bytes" >/dev/null
 }
 
-# ================ 清理辅助 ================
+# ========= 清理辅助 =========
 safe_pkill_children() {
   local sig="$1" ppid="$2"
   if command -v pkill >/dev/null 2>&1; then
@@ -283,7 +285,7 @@ safe_pkill_children() {
   fi
 }
 
-# ================ CPU 限制实现（清理阶段静默） ================
+# ========= CPU 限制 =========
 cores_count() { command -v nproc >/dev/null 2>&1 && nproc || echo 1; }
 detect_limit_method() {
   if [[ -z "$LIMIT_METHOD" ]]; then
@@ -376,14 +378,13 @@ normal_usage_scheduler() {
     limit_apply_percent "$target"; sleep "$dur"
   done
 }
-is_scheduler_running() { [[ -n "${LIMITER_PID:-}" ]] && kill -0 "$LIMITER_PID" 2>/dev/null; }
-start_normal_usage() { is_scheduler_running || { normal_usage_scheduler & LIMITER_PID=$!; echo "${C_GREEN}[*] 已启用：模拟正常使用。${C_RESET}"; }; }
+start_normal_usage() { [[ -n "${LIMITER_PID:-}" ]] && kill -0 "$LIMITER_PID" 2>/dev/null || { normal_usage_scheduler & LIMITER_PID=$!; echo "${C_GREEN}[*] 已启用：模拟正常使用。${C_RESET}"; }; }
 stop_normal_usage() { kill_scheduler; }
 limit_set_mode() {
   set +e
   local mode="$1"; detect_limit_method
   case "$mode" in
-    0) LIMIT_MODE=0; stop_normal_usage; kill_cpulimit_watchers; limit_apply_percent 100; echo "${C_GREEN}[+] 已清除 CPU 限制。${C_RESET}" ;;
+    0) LIMIT_MODE=0; stop_normal_usage; kill_cpulimit_watchERS; limit_apply_percent 100; echo "${C_GREEN}[+] 已清除 CPU 限制。${C_RESET}" ;;
     1) LIMIT_MODE=1; stop_normal_usage; [[ "$LIMIT_METHOD" == "cgroup" ]] && cgroup_enter_self; limit_apply_percent 50; echo "${C_GREEN}[+] 已设置恒定 50%。${C_RESET}" ;;
     2) LIMIT_MODE=2; [[ "$LIMIT_METHOD" == "cgroup" ]] && cgroup_enter_self; start_normal_usage ;;
   esac
@@ -401,7 +402,7 @@ ensure_limit_on_current_run() {
   fi
 }
 
-# ================ 线程管理 ================
+# ========= 线程管理 =========
 spawn_dl() { local id="$1"; download_worker "$id" & local pid=$!; DL_PIDS["$id"]=$pid; PIDS+=("$pid"); if [[ "$LIMIT_METHOD" == "cpulimit" && "$LIMIT_MODE" -eq 1 ]]; then local per; per=$(calc_cpulimit_per_proc 50); cpulimit_apply_for_pid "$pid" "$per"; fi; }
 spawn_ul() { local id="$1"; upload_worker "$id" & local pid=$!; UL_PIDS["$id"]=$pid; PIDS+=("$pid"); if [[ "$LIMIT_METHOD" == "cpulimit" && "$LIMIT_MODE" -eq 1 ]]; then local per; per=$(calc_cpulimit_per_proc 50); cpulimit_apply_for_pid "$pid" "$per"; fi; }
 
@@ -447,7 +448,7 @@ upload_worker() {
   done
 }
 
-# ================ 定时汇总（清理阶段静默） ================
+# ========= 定时汇总 =========
 print_summary_once() {
   local dl=0 ul=0
   [[ -f "$DL_TOTAL_FILE" ]] && dl=$(cat "$DL_TOTAL_FILE")
@@ -469,13 +470,11 @@ stop_summary() {
     kill -TERM "$SUMMARY_PID" 2>/dev/null || true
     wait "$SUMMARY_PID" 2>/dev/null || true
     SUMMARY_PID=
-    if (( QUIET_SHUTDOWN == 0 )); then
-      echo "${C_GREEN}[+] 已停止定时汇总。${C_RESET}"
-    fi
+    (( QUIET_SHUTDOWN == 0 )) && echo "${C_GREEN}[+] 已停止定时汇总。${C_RESET}"
   fi
 }
 
-# ================ 看门狗 ================
+# ========= 看门狗 =========
 purge_dead_pids() {
   local alive=() pid
   for pid in "${PIDS[@]:-}"; do kill -0 "$pid" 2>/dev/null && alive+=("$pid"); done
@@ -523,9 +522,9 @@ watchdog_loop() {
   done
 }
 
-# ================ 启停控制 ================
-init_and_check() { check_curl || return 1; 
-  # 计数器
+# ========= 启停控制 =========
+init_and_check() {
+  check_curl || return 1
   local bases=(); [[ -n "${TMPDIR:-}" ]] && bases+=("$TMPDIR"); bases+=("/dev/shm" "/var/tmp" ".")
   COUNTER_DIR=""
   for base in "${bases[@]}"; do
@@ -571,6 +570,10 @@ start_consumption() {
   init_and_check || { echo "${C_RED}无法启动：初始化失败。${C_RESET}"; return 1; }
   MODE="$mode"; PIDS=(); DL_PIDS=(); UL_PIDS=(); DL_RESTARTS=(); UL_RESTARTS=()
 
+  # 确保地址池非空（防止非交互调用）
+  ((${#ACTIVE_URLS[@]}==0)) && ACTIVE_URLS=("${URLS[@]}")
+  if [[ "$MODE" != "d" ]] && ((${#ACTIVE_UPLOAD_URLS[@]}==0)); then ACTIVE_UPLOAD_URLS=("${UPLOAD_URLS[0]}"); fi
+
   echo "${C_BOLD}[*] $(human_now) 启动：模式=${MODE}  下载线程=${dl_n}  上传线程=${ul_n}${C_RESET}"
   echo "[*] 定时汇总：$( ((SUMMARY_INTERVAL>0)) && echo "每 ${SUMMARY_INTERVAL}s" || echo "关闭" )"
   (( END_TS > 0 )) && echo "[*] 预计停止于：$(date_human_ts "$END_TS")"
@@ -589,14 +592,14 @@ start_consumption() {
 
   echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 或选菜单 3 可停止。${C_RESET}"
   wait_first_output
-  if (( LIMIT_MODE>0 )); then ensure_limit_on_current_run; fi
+  (( LIMIT_MODE>0 )) && ensure_limit_on_current_run
 }
 
 stop_consumption() {
   (( STOPPED )) && return 0
   STOPPED=1
-  QUIET_SHUTDOWN=1        # 清理阶段静默冗余提示
-  NONE_WARNED=1           # 抑制 limit_apply_percent 的能力告警
+  QUIET_SHUTDOWN=1
+  NONE_WARNED=1  # 退出阶段静默能力告警
 
   echo "[*] $(human_now) 正在停止全部线程…"
 
@@ -629,9 +632,9 @@ stop_consumption() {
   echo "[+] 已全部停止。"
 }
 
-# ================ 交互启动/限速/CPU 菜单项 ================
+# ========= 交互 =========
 list_download_urls() { echo; echo "${C_BOLD}下载地址（共 ${#URLS[@]} 个）：${C_RESET}"; local i=0; for u in "${URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done; }
-list_upload_urls() { echo; echo "${C_BOLD}上传地址（共 ${#UPLOAD_URLS[@]} 个）：${C_RESET}"; local i=0; for u in "${UPLOAD_URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done; }
+list_upload_urls()  { echo; echo "${C_BOLD}上传地址（共 ${#UPLOAD_URLS[@]} 个）：${C_RESET}"; local i=0; for u in "${UPLOAD_URLS[@]}"; do printf "  %2d) %s\n" "$((++i))" "$u"; done; }
 
 interactive_start() {
   echo; echo "${C_BOLD}请选择消耗模式：${C_RESET}"
@@ -707,7 +710,7 @@ configure_cpu_limit_mode() {
   echo "${C_DIM}说明：优先 cgroup v2；否则退回 cpulimit；模拟模式周期性调整目标负载并穿插短突发与休息窗口。${C_RESET}"
 }
 
-# ================ Trap / 统一清理 ================
+# ========= Trap / 统一清理 =========
 cleanup_all() {
   (( CLEANING )) && return 0
   CLEANING=1
@@ -723,7 +726,7 @@ on_exit() { cleanup_all; }
 trap on_int_term INT TERM
 trap on_exit EXIT
 
-# ================ 主菜单 ================
+# ========= 主菜单 =========
 menu() {
   while true; do
     echo
