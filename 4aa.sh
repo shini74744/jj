@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # 流量消耗/测速脚本（分块/仅脚本限速/CPU行为模拟/熔断与看门狗/定时汇总/强力清理）
-# Changelog（相较你上一版）：
+# Changelog（相较上一版）：
 # - 新增：传输“停滞杀手” (--speed-time/--speed-limit) + 更激进超时（可用环境变量调）
 # - 新增：端点熔断/冷却（失败线性回退：5s,10s,15s…，自动绕过抽风节点）
 # - 新增：线程级看门狗（心跳超时→自动杀死并拉起同ID线程）
 # - 打磨：URL池去重、IPv4/IPv6自动探测（IP_VERSION=0）、cpulimit含子进程、跨平台 date/kill 兜底
+# - 加固：Ctrl+C/停止时显式终止看门狗与CPU调度器，恢复CPU限额到100%，确保完全退出与清理
 
 set -Euo pipefail
 
@@ -133,6 +134,9 @@ CGROUP_DIR=""             # cgroup v2 路径
 LIMITER_PID=              # 调度器 PID（mode=2）
 CPULIMIT_WATCHERS=()      # cpulimit PID
 NONE_WARNED=0
+
+# 显式跟踪看门狗 PID
+WATCHDOG_PID=
 
 #############################
 # 熔断/冷却（下载&上传共用）
@@ -373,11 +377,13 @@ cgroup_set_percent() {
   local period=${CGROUP_PERIOD_US}
   if (( pct <= 0 || pct >= 100 )); then echo "max" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true; set -e; return 0; fi
   local n; n=$(cores_count); local quota; quota=$(awk -v P="$period" -v N="$n" -v R="$pct" 'BEGIN{printf "%.0f", P*N*R/100}')
-  echo "$quota $period" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
+  echo "$quota $period" > "$CGROUP_DIR/cpu.max" 2>/devnul
+
   set -e
 }
 cpulimit_apply_for_pids() {
-  local pct="$1"; kill_cpulimit_watchers; command -v cpulimit >/dev/null 2>&1 || return 0; ((${#PIDS[@]})) || return 0
+  local pct="$1"; kill_cpulimit_watchERS=(); command -v cpulimit >/dev/null 2>&1 || return 0
+  ((${#PIDS[@]})) || return 0
   local inc_child_opt=""
   if cpulimit -h 2>&1 | grep -qE -- '-z|children'; then inc_child_opt="-z"; fi
   for pid in "${PIDS[@]}"; do cpulimit -p "$pid" -l "$pct" $inc_child_opt -b >/dev/null 2>&1 & CPULIMIT_WATCHERS+=("$!"); done
@@ -618,9 +624,11 @@ start_consumption() {
     for ((i=1; i<=ul_n; i++)); do : > "$COUNTER_DIR/hb.ul.$i"; spawn_ul "$i"; sleep 0.05; done
   fi
 
-  # 定时汇总 + 看门狗
+  # 定时汇总 + 看门狗（保存 WATCHDOG_PID，便于停止时清理）
   start_summary
-  (( WATCHDOG_ENABLE==1 )) && watchdog_loop &
+  if (( WATCHDOG_ENABLE==1 )); then
+    watchdog_loop & WATCHDOG_PID=$!
+  fi
 
   echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 或选菜单 3 可停止。${C_RESET}"
   wait_first_output
@@ -628,6 +636,18 @@ start_consumption() {
 }
 
 stop_consumption() {
+  # 显式终止看门狗（若仍在）
+  if [[ -n "${WATCHDOG_PID:-}" ]] && kill -0 "$WATCHDOG_PID" 2>/dev/null; then
+    kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
+    wait "$WATCHDOG_PID" 2>/dev/null || true
+    WATCHDOG_PID=
+  fi
+
+  # 显式停止 CPU 调度器（若开启了“模拟正常使用”）
+  kill_scheduler
+  # 恢复 CPU 限制为 100%
+  limit_apply_percent 100
+
   if ! is_running; then
     echo "${C_YELLOW}[*] 当前没有运行中的线程。${C_RESET}"
   else
