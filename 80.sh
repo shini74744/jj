@@ -23,7 +23,7 @@ builtin_dns=(
   8.26.56.26 8.20.247.20
 )
 
-# ========= 颜色（自动检测TTY；NO_COLOR禁用） =========
+# 颜色（自动检测TTY；NO_COLOR禁用）
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   RESET=$'\033[0m'
   GREEN=$'\033[32m'
@@ -37,9 +37,8 @@ else
 fi
 
 avg_color_for_value() {
-  # 参数: 平均延迟(字符串)，支持 "N/A"
   local a="$1"
-  if [[ "$a" == "N/A" ]]; then printf "%s" "$YELLOW"; return; fi
+  if [[ "$a" == "N/A" || -z "$a" ]]; then printf "%s" "$YELLOW"; return; fi
   if awk -v a="$a" 'BEGIN{exit !(a<1)}';   then printf "%s" "$BOLD_GREEN"; return; fi
   if awk -v a="$a" 'BEGIN{exit !(a<5)}';   then printf "%s" "$GREEN";      return; fi
   if awk -v a="$a" 'BEGIN{exit !(a<20)}';  then printf "%s" "$YELLOW";     return; fi
@@ -47,7 +46,12 @@ avg_color_for_value() {
   printf "%s" "$RED"
 }
 
-# ========= 读取目标 =========
+fmt_ms() {  # 把数值格式化为 3 位小数，N/A 原样
+  local v="$1"
+  if [[ "$v" == "N/A" || -z "$v" ]]; then printf "N/A"; else printf "%.3f" "$v"; fi
+}
+
+# 读取目标
 targets=()
 if [[ -n "$LIST_FILE" ]]; then
   [[ -f "$LIST_FILE" ]] || { echo "未找到列表文件: $LIST_FILE"; exit 1; }
@@ -63,7 +67,7 @@ fi
 
 command -v ping >/dev/null 2>&1 || { echo "未找到 ping 命令"; exit 1; }
 
-# ========= 判断 ping 风格 =========
+# 判断 ping 风格
 PING_STYLE="GNU"
 if ping -h 2>&1 | grep -qi busybox; then
   PING_STYLE="BUSYBOX"
@@ -79,14 +83,14 @@ total=${#targets[@]}
 echo "目标数: $total | 每个目标 ping 次数: $COUNT"
 echo "开始测试 ..."
 
-# ========= 进度 =========
+# 进度行
 show_progress() {
   local cur="$1" host="$2"
   local pct=$(( cur * 100 / total ))
   printf "\r进度: [%d/%d | %3d%%] 正在测试: %-18s" "$cur" "$total" "$pct" "$host"
 }
 
-# ========= 单个目标 =========
+# 单目标测试 -> CSV: host,loss,min,avg,max,mdev
 ping_once() {
   local host="$1" count="$2" out loss rline rmin ravg rmax rdev
   case "$PING_STYLE" in
@@ -109,29 +113,42 @@ ping_once() {
   printf "%s,%s,%s,%s,%s,%s\n" "$host" "$loss" "$rmin" "$ravg" "$rmax" "$rdev"
 }
 
-# ========= 主循环 =========
 i=0
 for host in "${targets[@]}"; do
   i=$((i+1))
   show_progress "$i" "$host"
   line="$(ping_once "$host" "$COUNT")"
+  # 解析结果行，中文+单位+颜色，替换原来的生硬CSV
+  IFS=',' read -r h loss min avg max mdev <<<"$line"
+  minf="$(fmt_ms "$min")"; avgf="$(fmt_ms "$avg")"; maxf="$(fmt_ms "$max")"; mdevf="$(fmt_ms "$mdev")"
+  # 丢包颜色
+  loss_num="$(printf "%s" "$loss" | tr -d '%')"
+  if awk -v l="$loss_num" 'BEGIN{exit !(l>0)}'; then loss_color="$RED"; else loss_color="$BOLD_GREEN"; fi
+  # 平均延迟颜色
+  avg_color="$(avg_color_for_value "$avgf")"
+  # 擦除进度行并打印中文化的结果行
   printf "\r\033[2K"
-  echo "[$i/$total] $line"
+  printf "[%d/%d] %-18s | 丢包 %s%s%s | 最小 %sms | 平均 %s%sms%s | 最大 %sms | 抖动 %sms\n" \
+    "$i" "$total" "$h" \
+    "$loss_color" "$loss" "$RESET" \
+    "$minf" \
+    "$avg_color" "$avgf" "$RESET" \
+    "$maxf" "$mdevf"
+  # 仍把原始CSV写入临时文件，便于后续排序/导出
   echo "$line" >> "$TMP"
 done
 
 echo
-# ========= 中文表头 =========
+# 中文表头
 printf "%s%-22s %-8s %-10s %-10s %-10s %-10s%s\n" "$CYAN" "目标" "丢包" "最小(ms)" "平均(ms)" "最大(ms)" "抖动" "$RESET"
 echo "--------------------------------------------------------------------------------"
 
-# ========= 排序并彩色渲染输出 =========
+# 排序并彩色输出汇总
 awk -F, '{loss=$2; gsub(/%/,"",loss); if(loss==""||loss=="N/A") loss=100;
           avg=$4; if(avg==""||avg=="N/A") avgv=999999; else avgv=avg+0;
           printf "%s,%s,%s,%.6f,%s,%s\n",$1,loss,$3,avgv,$5,$6}' "$TMP" \
 | sort -t, -k2n -k4n \
 | while IFS=, read -r host lossn min avgn max mdev; do
-    # 组装各列，先就位对齐，再上色（避免ANSI破坏对齐）
     printf -v host_cell "%-22s" "$host"
     printf -v loss_cell "%-8s"  "$(printf "%.1f%%" "$lossn")"
     if awk -v a="$avgn" 'BEGIN{exit (a>=999999)?0:1}'; then avg_disp="N/A"; else printf -v avg_disp "%.3f" "$avgn"; fi
@@ -139,12 +156,9 @@ awk -F, '{loss=$2; gsub(/%/,"",loss); if(loss==""||loss=="N/A") loss=100;
     printf -v avg_cell  "%-10s" "$avg_disp"
     printf -v max_cell  "%-10s" "$max"
     printf -v mdev_cell "%-10s" "$mdev"
-
     # 颜色
     if awk -v l="$lossn" 'BEGIN{exit !(l>0)}'; then loss_color="$RED"; else loss_color="$BOLD_GREEN"; fi
     avg_color="$(avg_color_for_value "$avg_disp")"
-
-    # 打印（仅对“丢包/平均”着色）
     printf "%-22s %s%s%s %s%-10s%s %-10s %-10s %-10s\n" \
       "$host_cell" \
       "$loss_color" "$loss_cell" "$RESET" \
@@ -152,7 +166,7 @@ awk -F, '{loss=$2; gsub(/%/,"",loss); if(loss==""||loss=="N/A") loss=100;
       "$min_cell" "$max_cell" "$mdev_cell"
   done
 
-# ========= 可选CSV导出 =========
+# 可选CSV导出
 if [[ "${CSV_OUT:-}" == "csv" ]]; then
   OUT="dns_ping_results.csv"
   echo "host,loss,min,avg,max,mdev" > "$OUT"
