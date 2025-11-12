@@ -1,23 +1,16 @@
 #!/usr/bin/env bash
-# DNS 公共服务器连通性测试（按国家/地区抓取）
-# - 从 publicdnsserver.com/<country-slug>/ 解析 IP
-# - 过滤无效/私网 IPv4，保留 IPv6
-# - ping 统计（丢包/最小/平均/最大/抖动）
-# - 查询地区/ASN/公司（ip-api.com，带简单缓存）
-# - 排序按平均延迟升序；对齐输出
-# - 作者提示（红色）：作者-大大怪 | 探针地址：shli.io
 
 set -u
 set -o pipefail
 
-COUNT=${COUNT:-10}              # 每个目标 ping 次数
-TOPN=${TOPN:-30}                # 每个国家抓取的最多目标数
-SLEEP_META=${SLEEP_META:-0.15}  # 元数据查询间隔（防限速）
+COUNT=${COUNT:-10}
+TOPN=${TOPN:-30}
+SLEEP_META=${SLEEP_META:-0.15}
 META_CACHE_DIR="${META_CACHE_DIR:-/tmp/dns_meta_cache}"
 mkdir -p "$META_CACHE_DIR" >/dev/null 2>&1 || true
 
-# ------- 依赖检查 -------
-require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "缺少依赖：$1"; exit 1; }; }
+# deps
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "missing dependency: $1"; exit 1; }; }
 require_cmd curl
 require_cmd awk
 require_cmd sed
@@ -31,7 +24,7 @@ if command -v ping6 >/dev/null 2>&1; then
   PING6_BIN="ping6"
 fi
 
-# ------- 颜色与作者横幅 -------
+# color banner (red)
 if [ -t 1 ] && [ "${TERM:-}" != "dumb" ]; then
   RED=$'\033[1;31m'
   RESET=$'\033[0m'
@@ -39,10 +32,9 @@ else
   RED=""
   RESET=""
 fi
-printf "%b\n\n" "${RED}作者-大大怪  |  探针地址：shli.io${RESET}"
+printf "%b\n\n" "${RED}作者-DadaGi大大怪 赞助探针地址shli.io${RESET}"
 
-# ------- 工具函数 -------
-# 严格提取合法 IP（IPv4 每段 0-255；IPv6 粗略）
+# extract valid IPs (IPv4 strict / IPv6 loose)
 extract_ips() {
   sed -E 's/<[^>]+>/ /g' \
   | tr -c '0-9A-Fa-f:.' '\n' \
@@ -60,7 +52,7 @@ extract_ips() {
     '
 }
 
-# 过滤私网/保留（仅 IPv4）
+# filter private/reserved IPv4
 is_public_ipv4() {
   local ip="$1"; IFS=. read -r a b c d <<<"$ip" || return 1
   if ((a==10)) || ((a==127)) || ((a==192 && b==168)) || ((a==169 && b==254)) \
@@ -71,7 +63,7 @@ is_public_ipv4() {
   return 0
 }
 
-# 标准化国家 -> slug
+# normalize country to slug
 normalize_country_to_slug() {
   local raw="$1"
   local x compact
@@ -127,7 +119,7 @@ normalize_country_to_slug() {
   echo "$x"
 }
 
-# 抓取某国家页面，提取 IP
+# fetch IPs from publicdnsserver page
 fetch_country_ips() {
   local slug="$1"
   local url="https://publicdnsserver.com/${slug}/"
@@ -137,7 +129,7 @@ fetch_country_ips() {
   printf '%s' "$html" | extract_ips
 }
 
-# 取元数据（缓存 1 小时）
+# metadata (ip-api) with 1h cache
 get_meta_json() {
   local ip="$1"
   local cache="$META_CACHE_DIR/$ip.json"
@@ -162,12 +154,12 @@ get_meta_json() {
   sleep "$SLEEP_META"
 }
 
-# 从 JSON 粗提字段（无 jq 依赖）
+# poor-man's json getter (no jq)
 json_get() {
   echo "$1" | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p"
 }
 
-# 解析 ping 输出
+# parse ping output (returns: loss,min,avg,max,mdev)
 parse_ping() {
   local out; out=$(cat)
   local loss min avg max mdev rtt
@@ -182,7 +174,7 @@ parse_ping() {
   printf '%s,%s,%s,%s,%s\n' "$loss" "$min" "$avg" "$max" "$mdev"
 }
 
-# ------- 主流程 -------
+# main
 read -rp "请输入英文国家名（如 Japan / United States / South Korea；或 ISO 两字母，如 JP）： " USER_REGION || USER_REGION=""
 SLUG=$(normalize_country_to_slug "${USER_REGION:-}")
 [ -z "$SLUG" ] && SLUG="japan"
@@ -203,7 +195,6 @@ while IFS= read -r ip; do
   fi
 done < <(printf '%s\n' "$MAP_IPS_RAW" | awk 'NF{if(!seen[$0]++){print}}')
 
-# 限量 TOPN + 追加 1.1.1.1 / 8.8.8.8
 for ip in "${TARGETS[@]}"; do
   if [ -z "${seen[$ip]+x}" ]; then
     TMP_LIST+=("$ip"); seen["$ip"]=1
@@ -268,9 +259,7 @@ for ip in "${TARGETS[@]}"; do
 done
 echo
 
-# ===== 输出表格（按平均延迟排序后对齐显示）=====
 HEADER=$'编号\t目标\t地区\tASN\t公司\t丢包\t最小(ms)\t平均(ms)\t最大(ms)\t抖动'
-
 BODY=$(
   printf '%b\n' "${RESULTS[@]}" \
   | LC_ALL=C sort -t$'\t' -k1,1n \
@@ -286,7 +275,6 @@ BODY=$(
 if command -v column >/dev/null 2>&1; then
   { printf '%s\n' "$HEADER"; printf '%s\n' "$BODY"; } | column -t -s $'\t'
 else
-  # 回退：定宽打印
   printf "%-4s %-39s %-18s %-8s %-28s %-6s %-9s %-9s %-9s %-7s\n" \
     "编号" "目标" "地区" "ASN" "公司" "丢包" "最小(ms)" "平均(ms)" "最大(ms)" "抖动"
   printf -- "-----------------------------------------------------------------------------------------------\n"
