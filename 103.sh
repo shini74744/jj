@@ -5,6 +5,7 @@
 # - ping 统计（丢包/最小/平均/最大/抖动）
 # - 查询地区/ASN/公司（ip-api.com，带简单缓存）
 # - 排序按平均延迟升序；对齐输出
+# - 作者提示（红色）：作者-大大怪 | 探针地址：shli.io
 
 set -u
 set -o pipefail
@@ -29,6 +30,16 @@ PING6_BIN="ping -6"
 if command -v ping6 >/dev/null 2>&1; then
   PING6_BIN="ping6"
 fi
+
+# ------- 颜色与作者横幅 -------
+if [ -t 1 ] && [ "${TERM:-}" != "dumb" ]; then
+  RED=$'\033[1;31m'
+  RESET=$'\033[0m'
+else
+  RED=""
+  RESET=""
+fi
+printf "%b\n\n" "${RED}作者-大大怪  |  探针地址：shli.io${RESET}"
 
 # ------- 工具函数 -------
 # 严格提取合法 IP（IPv4 每段 0-255；IPv6 粗略）
@@ -220,7 +231,7 @@ fi
 idx=0
 for ip in "${TARGETS[@]}"; do
   idx=$((idx+1))
-  pct=$(( idx * 100 / (N==0 ? 1 : N) ))  # 正常情况下 N>0；此处兜底
+  pct=$(( idx * 100 / (N==0 ? 1 : N) ))
 
   printf "进度: [%d/%d | %3d%%] #%d   正在测试: %s\r" "$idx" "$N" "$pct" "$idx" "$ip"
 
