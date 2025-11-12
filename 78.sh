@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# 用法:
+#   ./dns_ping_check.sh [list_file] [count] [csv]
+#   list_file: 可选，目标IP/域名每行一个；省略则用内置公共DNS
+#   count    : 可选，每个目标ping包数(默认10)
+#   csv      : 可选，传 "csv" 则导出 dns_ping_results.csv
+
+set -euo pipefail
+
+LIST_FILE="${1:-}"
+COUNT="${2:-10}"
+CSV_OUT="${3:-}"
+
+# 内置公共DNS
+builtin_dns=(
+  1.1.1.1 1.0.0.1
+  8.8.8.8 8.8.4.4
+  9.9.9.9 149.112.112.112
+  208.67.222.222 208.67.220.220
+  94.140.14.14 94.140.15.15
+  64.6.64.6 64.6.65.6
+  8.26.56.26 8.20.247.20
+)
+
+# 读取目标
+targets=()
+if [[ -n "$LIST_FILE" ]]; then
+  [[ -f "$LIST_FILE" ]] || { echo "未找到列表文件: $LIST_FILE"; exit 1; }
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="$(printf "%s" "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -n "$line" ]] && targets+=("$line")
+  done < "$LIST_FILE"
+else
+  targets=("${builtin_dns[@]}")
+fi
+[[ ${#targets[@]} -gt 0 ]] || { echo "目标列表为空"; exit 1; }
+
+command -v ping >/dev/null 2>&1 || { echo "未找到 ping 命令"; exit 1; }
+
+# 判断 ping 风格
+PING_STYLE="GNU"
+if ping -h 2>&1 | grep -qi busybox; then
+  PING_STYLE="BUSYBOX"
+elif ping -h 2>&1 | grep -qi bsd; then
+  PING_STYLE="BSD"
+fi
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+: >"$TMP"
+
+echo "目标数: ${#targets[@]} | 每个目标 ping 次数: $COUNT"
+echo "开始测试 ..."
+
+ping_once() {
+  local host="$1" count="$2" out loss rline rmin ravg rmax rdev
+  case "$PING_STYLE" in
+    GNU)     out="$(ping -n -c "$count" -W 2 "$host" 2>&1)" || true ;;
+    BUSYBOX) out="$(ping -n -c "$count" -W 2 -w $((count*3)) "$host" 2>&1)" || true ;;
+    BSD)     out="$(ping -n -c "$count" "$host" 2>&1)" || true ;;
+  esac
+  loss="$(printf "%s" "$out" | awk -F', ' '/packet loss/{print $3}' | sed -e 's/packet loss//' -e 's/ //g')"
+  [[ -z "$loss" ]] && loss="$(printf "%s" "$out" | sed -n 's/.* \([0-9.]\+%\) packet loss.*/\1/p' | head -n1)"
+  [[ -z "$loss" ]] && loss="100%"
+  rline="$(printf "%s" "$out" | grep -E 'rtt|min/avg/max|round-trip' || true)"
+  if [[ -n "$rline" ]]; then
+    IFS='/' read -r rmin ravg rmax rdev <<<"$(printf "%s" "$rline" | awk -F'=' '{print $2}' | awk '{print $1}')"
+  else
+    rmin="N/A"; ravg="N/A"; rmax="N/A"; rdev="N/A"
+  fi
+  if printf "%s" "$out" | grep -qiE 'unknown host|Name or service not known|100% packet loss|Destination .* Unreachable|Request timeout'; then
+    loss="100%"; rmin="N/A"; ravg="N/A"; rmax="N/A"; rdev="N/A"
+  fi
+  printf "%s,%s,%s,%s,%s,%s\n" "$host" "$loss" "$rmin" "$ravg" "$rmax" "$rdev"
+}
+
+i=0
+for host in "${targets[@]}"; do
+  i=$((i+1))
+  line="$(ping_once "$host" "$COUNT")"
+  echo "$line" >> "$TMP"
+  echo "[$i/${#targets[@]}] $line"
+done
+
+echo
+printf "%-22s %-8s %-8s %-8s %-8s %-8s\n" "HOST" "LOSS" "MIN(ms)" "AVG(ms)" "MAX(ms)" "MDEV"
+echo "--------------------------------------------------------------------------------"
+
+# 单行 awk：转数值字段并排序
+awk -F, '{loss=$2; gsub(/%/,"",loss); if(loss==""||loss=="N/A") loss=100;
+          avg=$4; if(avg==""||avg=="N/A") avgv=999999; else avgv=avg+0;
+          printf "%s,%s,%s,%.6f,%s,%s\n",$1,loss,$3,avgv,$5,$6}' "$TMP" \
+| sort -t, -k2n -k4n \
+| while IFS=, read -r host loss min avgv max mdev; do
+    # avgv==999999 -> 显示 N/A
+    if awk -v a="$avgv" 'BEGIN{exit (a>=999999)?0:1}'; then avg_disp="N/A"; else printf -v avg_disp "%.3f" "$avgv"; fi
+    printf "%-22s %-8s %-8s %-8s %-8s %-8s\n" "$host" "$(printf "%.1f%%" "$loss")" "$min" "$avg_disp" "$max" "$mdev"
+  done
+
+# 可选CSV导出（无需再二次处理，直接原始TMP）
+if [[ "${CSV_OUT:-}" == "csv" ]]; then
+  OUT="dns_ping_results.csv"
+  echo "host,loss,min,avg,max,mdev" > "$OUT"
+  cat "$TMP" >> "$OUT"
+  echo
+  echo "已导出 CSV: $OUT"
+fi
