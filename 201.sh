@@ -32,7 +32,7 @@ else
   RED=""
   RESET=""
 fi
-printf "%b\n\n" "${RED}作者-大大怪  |  探针地址：shli.io${RESET}"
+printf "%b\n\n" "${RED}作者-DadaGi大大怪 赞助探针地址shli.io${RESET}"
 
 # extract valid IPs (IPv4 strict / IPv6 loose)
 extract_ips() {
