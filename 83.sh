@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
-# 从 publicdnsserver.com 按国家抓取 DNS 列表并批量 ping（中文进度+结果，排序汇总）
-# 用法示例：
-#   交互选择国家： ./dns_ping_pds.sh
-#   指定国家与次数： ./dns_ping_pds.sh -r US -c 15
-#   限制最多测试前 N 个地址： ./dns_ping_pds.sh -r Japan -n 20
-#   不附带 1.1.1.1/8.8.8.8： NO_ANYCAST=1 ./dns_ping_pds.sh -r DE
+# 从 publicdnsserver.com 按国家抓取 DNS 列表并批量 ping（中文进度+彩色+排序）
+# 用法：
+#   交互：bash dns_ping_pds.sh
+#   指定：bash dns_ping_pds.sh -r CN -c 10 -n 30
+# 选项：
+#   -r/--region  国家名或 ISO 两字母（如 CN/China、JP/Japan）
+#   -c/--count   每目标 ping 包数（默认 10）
+#   -n/--top     仅取前 N 个地址（默认 30）
+# 环境变量：
+#   NO_ANYCAST=1  不附带 1.1.1.1/8.8.8.8（默认附带）
 
 set -euo pipefail
 
 REGION=""; COUNT=10; TOPN=30
-ALWAYS_INCLUDE_ANYCAST="${NO_ANYCAST:-0}"   # 0=附带 1.1.1.1/8.8.8.8；1=不附带
+ALWAYS_INCLUDE_ANYCAST="${NO_ANYCAST:-0}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -r|--region) REGION="${2:-}"; shift 2;;
-    -c|--count)  COUNT="${2:-10}"; shift 2;;
-    -n|--top)    TOPN="${2:-30}"; shift 2;;
-    *) shift;;
+    -r|--region) REGION="${2:-}"; shift 2 ;;
+    -c|--count)  COUNT="${2:-10}"; shift 2 ;;
+    -n|--top)    TOPN="${2:-30}"; shift 2 ;;
+    *) shift ;;
   esac
 done
 
@@ -24,7 +28,7 @@ command -v curl >/dev/null || { echo "缺少 curl"; exit 1; }
 command -v awk  >/dev/null || { echo "缺少 awk";  exit 1; }
 command -v ping >/dev/null || { echo "缺少 ping"; exit 1; }
 
-# 颜色
+# -------- 颜色 --------
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   RESET=$'\033[0m'; GREEN=$'\033[32m'; BOLD_GREEN=$'\033[1;32m'
   YELLOW=$'\033[33m'; MAGENTA=$'\033[35m'; RED=$'\033[31m'; CYAN=$'\033[36m'
@@ -42,108 +46,106 @@ avg_color_for_value() {
   printf "%s" "$RED"
 }
 fmt_ms(){ local v="$1"; if [[ "$v" == "N/A" || -z "$v" ]]; then printf "N/A"; else printf "%.3f" "$v"; fi }
+fmt_loss(){ local s="$1"; s="${s%%%}"; [[ -z "$s" ]] && s="100"; printf "%s" "$s"; }
 
-# anycast 组（可选）
 ANYCAST=(1.1.1.1 8.8.8.8)
 
-# 把用户输入的国家名/ISO 转成站点 slug（小写+去空格等），含常见别名
+# -------- 把用户输入转成 slug --------
 normalize_slug() {
-  local s="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
-  s="$(echo "$s" | sed "s/['.,()\- _]//g; s/&/and/g")"
+  # 统一小写
+  local s; s="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  # & -> and
+  s="$(printf '%s' "$s" | sed -e 's/&/and/g')"
+  # 只保留 a-z 0-9（避免 sed 字符类连字符的坑）
+  s="$(printf '%s' "$s" | sed -e 's/[^a-z0-9]//g')"
+  # 常见别名映射
   case "$s" in
-    us|usa|unitedstatesofamerica) echo "unitedstates" ;;
-    gb|uk|greatbritain|britain|unitedkingdom) echo "unitedkingdom" ;;
-    kr|korea|republicofkorea|southkorea) echo "southkorea" ;;
-    ae|uae|unitedarabemirates) echo "unitedarabemirates" ;;
-    ci|cotedivoire|ivoire|cotedlvoire) echo "ivorycoast" ;;
-    cd|drcongo|congodemocratic|democraticrepublicofthecongo) echo "democraticrepublicofthecongo" ;;
-    hk|hongkong) echo "hongkong" ;;
-    tw|taiwan) echo "taiwan" ;;
-    cn|china|prc) echo "china" ;;
-    jp|japan) echo "japan" ;;
-    de|germany) echo "germany" ;;
-    fr|france) echo "france" ;;
-    es|spain) echo "spain" ;;
-    it|italy) echo "italy" ;;
-    nl|netherlands) echo "netherlands" ;;
-    ru|russia) echo "russia" ;;
-    br|brazil) echo "brazil" ;;
-    za|southafrica) echo "southafrica" ;;
-    nz|newzealand) echo "newzealand" ;;
-    cz|czech|czechrepublic) echo "czechia" ;;
-    mm|burma|myanmar) echo "myanmar" ;;
-    vn|vietnam) echo "vietnam" ;;
-    *) echo "$s" ;;
+    us|usa|unitedstatesofamerica|unitedstates) echo "unitedstates" ;;
+    uk|gb|greatbritain|britain|unitedkingdom) echo "unitedkingdom" ;;
+    kr|korea|republicofkorea|southkorea)      echo "southkorea" ;;
+    cn|china|prc)                              echo "china" ;;
+    jp|japan)                                  echo "japan" ;;
+    de|germany)                                echo "germany" ;;
+    fr|france)                                 echo "france" ;;
+    tw|taiwan)                                 echo "taiwan" ;;
+    hk|hongkong)                               echo "hongkong" ;;
+    sg|singapore)                              echo "singapore" ;;
+    es|spain)                                  echo "spain" ;;
+    it|italy)                                  echo "italy" ;;
+    nl|netherlands)                            echo "netherlands" ;;
+    br|brazil)                                 echo "brazil" ;;
+    in|india)                                  echo "india" ;;
+    au|australia)                              echo "australia" ;;
+    ca|canada)                                 echo "canada" ;;
+    *)                                         echo "$s" ;;
   esac
 }
 
-# 从 publicdnsserver.com 获取该国 DNS 列表（优先 download/slug.txt；失败就抓页面提取 IPv4）
 fetch_dns_list() {
   local slug="$1" tmp="$(mktemp)"
   local url_txt="https://publicdnsserver.com/download/${slug}.txt"
   local url_html="https://publicdnsserver.com/${slug}/"
 
-  # 1) 直接下纯文本
+  # 直接下载纯文本
   if curl -fsSL "$url_txt" -o "$tmp" && grep -Eq '([0-9]{1,3}\.){3}[0-9]{1,3}' "$tmp"; then
-    head -n "$TOPN" "$tmp"
-    rm -f "$tmp"; return 0
+    head -n "$TOPN" "$tmp"; rm -f "$tmp"; return 0
   fi
 
-  # 2) 抓取页面，解析 IPv4
-  if curl -fsSL "$url_html" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u | head -n "$TOPN" > "$tmp" \
-     && [[ -s "$tmp" ]]; then
-    cat "$tmp"; rm -f "$tmp"; return 0
+  # 回退：抓页面并提取 IPv4（若页面存在）
+  if curl -fsSL "$url_html" -o "$tmp" 2>/dev/null && grep -q . "$tmp"; then
+    grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "$tmp" | sort -u | head -n "$TOPN"
+    rm -f "$tmp"; return 0
   fi
 
   rm -f "$tmp"; return 1
 }
 
-# 交互获取国家
+# -------- 交互输入 --------
 if [[ -z "$REGION" ]]; then
-  echo "请输入要测试的国家/地区（可以写国家名，如 Japan，也可以写 ISO 两字母，如 JP）："
-  read -r REGION
+  read -rp "请输入要测试的国家/地区（可写 China/CN、Japan/JP、South Korea/KR 等）： " REGION
 fi
 REGION="$(echo "$REGION" | xargs)"
 [[ -n "$REGION" ]] || { echo "未输入国家/地区"; exit 1; }
 
 SLUG="$(normalize_slug "$REGION")"
-
-# 拉取 DNS 列表
-mapfile -t targets < <(fetch_dns_list "$SLUG" || true)
-if [[ ${#targets[@]} -eq 0 ]]; then
-  echo "从 publicdnsserver.com 获取失败（地区：$REGION / slug：$SLUG）。"
-  echo "提示：请确认该国家在网站的链接形式，例如 United States → unitedstates。"
+if [[ -z "$SLUG" ]]; then
+  echo "无法从输入“$REGION”解析出有效 slug，请换一种写法（如 China、United States、JP、KR）。"
   exit 1
 fi
 
-# 附带 anycast
+# -------- 拉取列表 --------
+mapfile -t targets < <(fetch_dns_list "$SLUG" || true)
+if [[ ${#targets[@]} -eq 0 ]]; then
+  echo "从 publicdnsserver.com 获取失败（地区：$REGION / slug：$SLUG）。"
+  echo "请检查该国家在该站的写法（例如 United States → unitedstates）。"
+  exit 1
+fi
+
+# 附带 anycast（默认开启，可用 NO_ANYCAST=1 关闭）
 if [[ "$ALWAYS_INCLUDE_ANYCAST" -eq 0 ]]; then
   targets+=("${ANYCAST[@]}")
 fi
 
-# 去重、裁剪
+# 去重
 declare -A seen; uniq_targets=()
 for t in "${targets[@]}"; do
   [[ -z "${seen[$t]:-}" ]] && uniq_targets+=("$t") && seen[$t]=1
 done
 targets=("${uniq_targets[@]}")
 
+# -------- ping 实现类型 --------
+PING_STYLE="GNU"
+if ping -h 2>&1 | grep -qi busybox; then PING_STYLE="BUSYBOX"
+elif ping -h 2>&1 | grep -qi bsd; then PING_STYLE="BSD"; fi
+
+TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT; : >"$TMP"
+
 total=${#targets[@]}
 echo "地区: $REGION（slug: $SLUG）| 目标数: $total | 每个目标 ping 次数: $COUNT"
 echo "将测试的目标：${targets[*]}"
 echo "开始测试 ..."
 
-# 兼容不同 ping 实现
-PING_STYLE="GNU"
-if ping -h 2>&1 | grep -qi busybox; then PING_STYLE="BUSYBOX"
-elif ping -h 2>&1 | grep -qi bsd; then PING_STYLE="BSD"; fi
-
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
-: >"$TMP"
-
 show_progress(){ local cur="$1" host="$2"; local pct=$(( cur * 100 / total )); printf "\r进度: [%d/%d | %3d%%] 正在测试: %-18s" "$cur" "$total" "$pct" "$host"; }
-fmt_loss() { local s="$1"; s="${s%%%}"; [[ -z "$s" ]] && s="100"; printf "%s" "$s"; }
 
 ping_once() {
   local host="$1" count="$2" out loss rline rmin ravg rmax rdev
