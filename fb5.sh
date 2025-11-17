@@ -348,11 +348,13 @@ actionban = curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKE
     -d "text=🔐 *SSH 登录提醒*\\n节点: $MACHINE_NAME\\n用户: <user>\\nIP: \`<ip>\`\\n主机: *<fq-hostname>*\\n时间: <time>"
 EOF
 
-    # 2.3 SSH 登录提醒 filter（匹配 Accepted password/publickey）
+    # 2.3 SSH 登录成功 filter（不再使用 %(__prefix_line)s，避免版本兼容问题）
     echo "📄 写入 /etc/fail2ban/filter.d/sshd-login.conf ..."
     cat > /etc/fail2ban/filter.d/sshd-login.conf <<'EOF'
 [Definition]
-failregex = ^%(__prefix_line)sAccepted (password|publickey|keyboard-interactive/pam) for (?P<user>\S+) from <HOST> .*$
+# 匹配 sshd 登录成功日志行
+# 示例：Nov 17 13:30:51 host sshd[12345]: Accepted password for root from 1.2.3.4 port 56789 ssh2
+failregex = ^.*sshd\[[0-9]+\]: Accepted (password|publickey|keyboard-interactive/pam) for (?P<user>\S+) from <HOST> .*$
 
 ignoreregex =
 EOF
@@ -418,7 +420,7 @@ EOF
 
     echo "🔄 重启 Fail2ban 以应用 Telegram 通知与 SSH 登录提醒..."
     if ! systemctl restart fail2ban; then
-        echo "❌ Fail2ban 启动失败，请检查 $JAIL 和 telegram*.conf 语法。"
+        echo "❌ Fail2ban 启动失败，请检查 $JAIL 和 telegram*.conf / sshd-login.conf 语法。"
         pause
         return
     fi
@@ -441,7 +443,7 @@ EOF
     echo "📌 之后："
     echo "   - IP 被 Fail2ban 封禁 → 会推送封禁告警（带节点名）"
     echo "   - 每次 SSH 登录成功 → 会推送登录提醒（带节点名）"
-    echo "   - 再次执行本菜单，可修改 BOT_TOKEN / CHAT_ID / 节点名"
+    echo "   - 再次执行本菜单，可修改 BOT_TOKEN / CHAT_ID / 节点名（以最后一次为准）"
     pause
 }
 
@@ -546,7 +548,11 @@ modify_ssh_params() {
     echo "✅ 修改已生效！"
     print_status_summary
     echo "📌 当前 SSH jail 详细状态："
-    fail2ban-client status sshd || true
+    if systemctl is-active --quiet fail2ban; then
+        fail2ban-client status sshd || echo "  (fail2ban 已运行，但 sshd jail 查询失败)"
+    else
+        echo "  fail2ban 未运行，无法获取 sshd jail 状态。"
+    fi
     echo ""
     pause
 }
