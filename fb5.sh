@@ -16,7 +16,7 @@
 #   5) 安装 / 更新快捷命令（fb5），一条命令直接打开本面板
 #
 # 说明：
-#   - 只对 [sshd] jail 和 ssh-login 提醒 jail 动手
+#   - 只对 [sshd] jail 和 sshd-login 提醒 jail 动手
 #   - 可反复执行，避免重复写 [sshd]
 # ============================================================
 
@@ -117,7 +117,7 @@ EOF
 }
 
 #-----------------------------
-# 状态总览：面板状态 / 开机启动 / jail 状态
+# 状态总览：面板状态 / 开机启动 / jail 状态 / 节点名
 #-----------------------------
 print_status_summary() {
     echo "---------------- 当前运行状态 ----------------"
@@ -125,6 +125,10 @@ print_status_summary() {
     local fb_enabled="未知"
     local sshd_jail="未知"
     local sshlogin_jail="未知"
+
+    # 读取节点名（如果配置过 TG）
+    load_telegram_vars
+    local node_name="${MACHINE_NAME:-未设置}"
 
     # Fail2ban 服务状态
     if command -v systemctl &>/dev/null; then
@@ -165,6 +169,7 @@ print_status_summary() {
         sshlogin_jail="未知（Fail2ban 未运行）"
     fi
 
+    echo "节点名称: $node_name"
     echo "面板状态: $fb_status"
     echo "开机启动: $fb_enabled"
     echo "SSH 防爆破 (sshd): $sshd_jail"
