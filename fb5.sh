@@ -6,8 +6,8 @@
 # 功能：
 #   1) 安装 / 配置 Fail2ban 仅用于 SSH 防爆破
 #   2) 对接 Telegram 通知：
-#        - IP 被封禁时推送告警
-#        - SSH 登录成功时推送提醒
+#        - IP 被封禁时推送告警（带节点名）
+#        - SSH 登录成功时推送提醒（带节点名）
 #   3) 卸载本脚本相关配置（可选同时卸载 fail2ban）
 #   4) 快捷修改 SSH 防爆破参数：
 #        - maxretry（失败次数）
@@ -30,6 +30,7 @@ FIREWALL=""
 JAIL="/etc/fail2ban/jail.local"
 INSTALL_CMD_PATH="/usr/local/bin/fb5"
 REMOTE_URL="https://raw.githubusercontent.com/shini74744/jj/refs/heads/main/fb5.sh"
+TELEGRAM_VARS="/etc/fail2ban/telegram-vars.conf"
 
 #-----------------------------
 # 工具函数
@@ -97,6 +98,79 @@ get_action_for_firewall() {
             echo "iptables-multiport"
             ;;
     esac
+}
+
+load_telegram_vars() {
+    if [[ -f "$TELEGRAM_VARS" ]]; then
+        # shellcheck source=/etc/fail2ban/telegram-vars.conf
+        source "$TELEGRAM_VARS"
+    fi
+}
+
+save_telegram_vars() {
+    mkdir -p "$(dirname "$TELEGRAM_VARS")"
+    cat > "$TELEGRAM_VARS" <<EOF
+BOT_TOKEN="${BOT_TOKEN:-}"
+CHAT_ID="${CHAT_ID:-}"
+MACHINE_NAME="${MACHINE_NAME:-}"
+EOF
+}
+
+#-----------------------------
+# 状态总览：面板状态 / 开机启动 / jail 状态
+#-----------------------------
+print_status_summary() {
+    echo "---------------- 当前运行状态 ----------------"
+    local fb_status="未知"
+    local fb_enabled="未知"
+    local sshd_jail="未知"
+    local sshlogin_jail="未知"
+
+    # Fail2ban 服务状态
+    if command -v systemctl &>/dev/null; then
+        if systemctl is-active --quiet fail2ban; then
+            fb_status="运行中"
+        else
+            fb_status="未运行"
+        fi
+
+        if systemctl is-enabled --quiet fail2ban 2>/dev/null; then
+            fb_enabled="是"
+        else
+            fb_enabled="否"
+        fi
+    else
+        fb_status="未知（无 systemd）"
+        fb_enabled="未知"
+    fi
+
+    # jail 状态
+    if command -v fail2ban-client &>/dev/null && systemctl is-active --quiet fail2ban; then
+        if fail2ban-client status sshd &>/dev/null; then
+            sshd_jail="已启用"
+        else
+            sshd_jail="未启用"
+        fi
+
+        if fail2ban-client status sshd-login &>/dev/null; then
+            sshlogin_jail="已启用"
+        else
+            sshlogin_jail="未启用"
+        fi
+    elif ! command -v fail2ban-client &>/dev/null; then
+        sshd_jail="未知（未安装 Fail2ban）"
+        sshlogin_jail="未知（未安装 Fail2ban）"
+    else
+        sshd_jail="未知（Fail2ban 未运行）"
+        sshlogin_jail="未知（Fail2ban 未运行）"
+    fi
+
+    echo "面板状态: $fb_status"
+    echo "开机启动: $fb_enabled"
+    echo "SSH 防爆破 (sshd): $sshd_jail"
+    echo "SSH 登录提醒 (sshd-login): $sshlogin_jail"
+    echo "------------------------------------------------"
+    echo ""
 }
 
 #-----------------------------
@@ -174,13 +248,15 @@ EOF
 
     echo ""
     echo "✅ SSH 防爆破配置完成！"
-    echo "📌 查看状态：fail2ban-client status sshd"
+    echo ""
+    print_status_summary
+    echo "📌 查看详细状态：fail2ban-client status sshd"
     echo ""
     pause
 }
 
 #-----------------------------
-# 2. 对接 Telegram 通知（封禁 + 登录提醒）
+# 2. 对接 Telegram 通知（封禁 + 登录提醒 + 节点名）
 #-----------------------------
 setup_telegram() {
     ensure_curl
@@ -191,26 +267,51 @@ setup_telegram() {
         return
     fi
 
+    load_telegram_vars
+
     echo "================ 对接 Telegram 通知 ================"
-    echo "提示：需要先在 Telegram 用 BotFather 创建机器人"
-    echo "再获取：BOT_TOKEN 和 CHAT_ID（你的个人或群组 ID）"
+    echo "需要信息："
+    echo "  - BOT_TOKEN：通过 BotFather 创建机器人得到"
+    echo "  - CHAT_ID：你自己的 ID 或群组 ID"
+    echo "  - 节点名称：给这台服务器起个昵称（例：香港1、日本-甲骨文1）"
+    echo "----------------------------------------------------"
+    echo "当前配置（如有）："
+    echo "  当前 BOT_TOKEN : ${BOT_TOKEN:-未设置}"
+    echo "  当前 CHAT_ID   : ${CHAT_ID:-未设置}"
+    echo "  当前 节点名称  : ${MACHINE_NAME:-未设置}"
+    echo "提示：回车留空 = 保留当前值（如果之前有）。"
     echo "===================================================="
     echo ""
 
-    read -rp "请输入 BOT_TOKEN（形如 123456:ABCDEF...）: " BOT_TOKEN
-    read -rp "请输入 CHAT_ID（纯数字）: " CHAT_ID
+    read -rp "请输入 BOT_TOKEN（回车保留当前）: " INPUT_TOKEN
+    if [[ -n "$INPUT_TOKEN" ]]; then
+        BOT_TOKEN="$INPUT_TOKEN"
+    fi
 
+    read -rp "请输入 CHAT_ID（回车保留当前）: " INPUT_CHAT
+    if [[ -n "$INPUT_CHAT" ]]; then
+        CHAT_ID="$INPUT_CHAT"
+    fi
+
+    read -rp "给这台服务器起个名字（例：香港1，回车保留当前/可留空）: " INPUT_NAME
+    if [[ -n "$INPUT_NAME" ]]; then
+        MACHINE_NAME="$INPUT_NAME"
+    fi
+
+    # 检查必要字段
     if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
-        echo "❌ BOT_TOKEN 或 CHAT_ID 不能为空"
+        echo "❌ BOT_TOKEN 或 CHAT_ID 为空，请至少设置一次。"
         pause
         return
     fi
+
+    save_telegram_vars
 
     mkdir -p /etc/fail2ban/action.d
     mkdir -p /etc/fail2ban/filter.d
     mkdir -p /etc/fail2ban/jail.d
 
-    # 2.1 封禁告警 action
+    # 2.1 封禁告警 action（带节点名）
     echo "📄 写入 /etc/fail2ban/action.d/telegram.conf ..."
     cat > /etc/fail2ban/action.d/telegram.conf <<EOF
 [Definition]
@@ -218,25 +319,25 @@ setup_telegram() {
 actionstart = curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
     -d "chat_id=$CHAT_ID" \
     -d "parse_mode=Markdown" \
-    -d "text=🚀 Fail2Ban 已启动于 *<fq-hostname>*"
+    -d "text=🚀 *Fail2Ban 已启动*\\n节点: $MACHINE_NAME\\n主机: *<fq-hostname>*"
 
 actionstop = curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
     -d "chat_id=$CHAT_ID" \
     -d "parse_mode=Markdown" \
-    -d "text=🛑 Fail2Ban 已停止于 *<fq-hostname>*"
+    -d "text=🛑 *Fail2Ban 已停止*\\n节点: $MACHINE_NAME\\n主机: *<fq-hostname>*"
 
 actionban = curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
     -d "chat_id=$CHAT_ID" \
     -d "parse_mode=Markdown" \
-    -d "text=🚫 *Fail2Ban 封禁告警*\\nJail: *<name>*\\nIP: \`<ip>\`\\n主机: *<fq-hostname>*\\n时间: <time>"
+    -d "text=🚫 *Fail2Ban 封禁告警*\\n节点: $MACHINE_NAME\\nJail: *<name>*\\n攻击 IP: \`<ip>\`\\n主机: *<fq-hostname>*\\n时间: <time>"
 
 actionunban = curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
     -d "chat_id=$CHAT_ID" \
     -d "parse_mode=Markdown" \
-    -d "text=✅ IP 解除封禁\\nJail: *<name>*\\nIP: \`<ip>\`\\n主机: *<fq-hostname>*\\n时间: <time>"
+    -d "text=✅ *IP 解除封禁*\\n节点: $MACHINE_NAME\\nJail: *<name>*\\nIP: \`<ip>\`\\n主机: *<fq-hostname>*\\n时间: <time>"
 EOF
 
-    # 2.2 SSH 登录提醒 action（只发消息，不封 IP）
+    # 2.2 SSH 登录提醒 action（带节点名，只发消息，不封 IP）
     echo "📄 写入 /etc/fail2ban/action.d/telegram-ssh-login.conf ..."
     cat > /etc/fail2ban/action.d/telegram-ssh-login.conf <<EOF
 [Definition]
@@ -244,7 +345,7 @@ EOF
 actionban = curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
     -d "chat_id=$CHAT_ID" \
     -d "parse_mode=Markdown" \
-    -d "text=🔐 *SSH 登录提醒*\\n用户: <user>\\nIP: \`<ip>\`\\n主机: *<fq-hostname>*\\n时间: <time>"
+    -d "text=🔐 *SSH 登录提醒*\\n节点: $MACHINE_NAME\\n用户: <user>\\nIP: \`<ip>\`\\n主机: *<fq-hostname>*\\n时间: <time>"
 EOF
 
     # 2.3 SSH 登录提醒 filter（匹配 Accepted password/publickey）
@@ -326,7 +427,7 @@ EOF
     echo "📨 发送 Telegram 测试通知..."
     TEST_RESP=$(curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
         -d "chat_id=$CHAT_ID" \
-        -d "text=Fail2ban+Telegram+通知对接测试（封禁与SSH登录提醒已启用）")
+        -d "text=Fail2ban+Telegram+对接成功\\n节点: $MACHINE_NAME")
 
     if echo "$TEST_RESP" | grep -q '"ok":true'; then
         echo "✅ 测试通知已发送，请在 Telegram 中检查是否收到。"
@@ -336,9 +437,11 @@ EOF
     fi
 
     echo ""
+    print_status_summary
     echo "📌 之后："
-    echo "   - IP 被 Fail2ban 封禁 → 会推送封禁告警"
-    echo "   - 每次 SSH 登录成功 → 会推送登录提醒"
+    echo "   - IP 被 Fail2ban 封禁 → 会推送封禁告警（带节点名）"
+    echo "   - 每次 SSH 登录成功 → 会推送登录提醒（带节点名）"
+    echo "   - 再次执行本菜单，可修改 BOT_TOKEN / CHAT_ID / 节点名"
     pause
 }
 
@@ -440,7 +543,9 @@ modify_ssh_params() {
     fi
 
     echo ""
-    echo "✅ 修改已生效！当前 SSH jail 状态："
+    echo "✅ 修改已生效！"
+    print_status_summary
+    echo "📌 当前 SSH jail 详细状态："
     fail2ban-client status sshd || true
     echo ""
     pause
@@ -478,7 +583,7 @@ install_update_shortcut() {
     echo ""
     echo "✅ 已安装 / 更新快捷命令：fb5"
     echo "👉 以后可以直接在任意目录运行：fb5"
-    echo "   当前这次执行仍然是老版本，下次运行 fb5 即加载新版本脚本。"
+    echo "   当前这次执行仍然是现有版本，下次运行 fb5 即加载新版本脚本。"
     echo ""
     pause
 }
@@ -493,6 +598,7 @@ uninstall_all() {
     echo "   - /etc/fail2ban/action.d/telegram.conf"
     echo "   - /etc/fail2ban/action.d/telegram-ssh-login.conf"
     echo "   - /etc/fail2ban/filter.d/sshd-login.conf"
+    echo "   - /etc/fail2ban/telegram-vars.conf"
     echo "   （不会删除系统自带的 jail.conf 等默认配置）"
     echo ""
     read -rp "是否同时删除快捷命令 $INSTALL_CMD_PATH ? [y/N]: " RM_CMD
@@ -519,6 +625,7 @@ uninstall_all() {
     rm -f /etc/fail2ban/action.d/telegram.conf
     rm -f /etc/fail2ban/action.d/telegram-ssh-login.conf
     rm -f /etc/fail2ban/filter.d/sshd-login.conf
+    rm -f "$TELEGRAM_VARS"
 
     echo "✅ Fail2ban 相关自定义配置文件已删除。"
 
@@ -552,8 +659,9 @@ main_menu() {
         echo " Fail2ban SSH 防爆破 + Telegram 通知 管理脚本"
         echo " Author: DadaGi 大大怪"
         echo "==============================================="
+        print_status_summary
         echo " 1) 安装 / 配置 SSH 防爆破"
-        echo " 2) 对接 TG 通知（封禁+SSH 登录提醒）"
+        echo " 2) 对接 TG 通知（封禁+SSH 登录提醒 + 节点名）"
         echo " 3) 卸载本脚本相关配置（可选卸载 fail2ban）"
         echo " 4) 快捷修改 SSH 防爆破参数（失败次数 / 封禁时长 / 检测周期）"
         echo " 5) 安装 / 更新快捷命令（fb5，一键打开本面板）"
