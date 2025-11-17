@@ -5,13 +5,15 @@
 #
 # 功能：
 #   1) 安装 / 配置 Fail2ban 仅用于 SSH 防爆破
-#   2) 对接 Telegram 通知（封禁时推送告警）
+#   2) 对接 Telegram 通知：
+#        - IP 被封禁时推送告警
+#        - SSH 登录成功时推送提醒
 #   3) 卸载本脚本相关配置（可选同时卸载 fail2ban）
+#   4) 快捷修改 SSH 防爆破参数（失败次数 / 封禁时长）
 #
 # 说明：
-#   - 只对 [sshd] jail 动手，不改动其他服务
+#   - 只对 [sshd] jail 和 ssh-login 提醒 jail 动手
 #   - 可反复执行，避免重复写 [sshd]
-#   - Telegram 部分自动生成 action.d/telegram.conf
 # ============================================================
 
 set -e
@@ -172,7 +174,7 @@ EOF
 }
 
 #-----------------------------
-# 2. 对接 Telegram 通知
+# 2. 对接 Telegram 通知（封禁 + 登录提醒）
 #-----------------------------
 setup_telegram() {
     ensure_curl
@@ -198,10 +200,12 @@ setup_telegram() {
         return
     fi
 
-    # 写入 Telegram action 配置
-    echo "📄 写入 /etc/fail2ban/action.d/telegram.conf ..."
     mkdir -p /etc/fail2ban/action.d
+    mkdir -p /etc/fail2ban/filter.d
+    mkdir -p /etc/fail2ban/jail.d
 
+    # 2.1 封禁告警 action
+    echo "📄 写入 /etc/fail2ban/action.d/telegram.conf ..."
     cat > /etc/fail2ban/action.d/telegram.conf <<EOF
 [Definition]
 
@@ -218,20 +222,53 @@ actionstop = curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOK
 actionban = curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
     -d "chat_id=$CHAT_ID" \
     -d "parse_mode=Markdown" \
-    -d "text=🚫 *Fail2Ban 封禁告警*\nJail: *<name>*\nIP: \`<ip>\`\n主机: *<fq-hostname>*\n时间: <time>"
+    -d "text=🚫 *Fail2Ban 封禁告警*\\nJail: *<name>*\\nIP: \`<ip>\`\\n主机: *<fq-hostname>*\\n时间: <time>"
 
 actionunban = curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
     -d "chat_id=$CHAT_ID" \
     -d "parse_mode=Markdown" \
-    -d "text=✅ IP 解除封禁\nJail: *<name>*\nIP: \`<ip>\`\n主机: *<fq-hostname>*\n时间: <time>"
+    -d "text=✅ IP 解除封禁\\nJail: *<name>*\\nIP: \`<ip>\`\\n主机: *<fq-hostname>*\\n时间: <time>"
 EOF
 
-    # 更新 sshd jail，将 telegram action 加进去
-    echo "🛠 修改 [sshd] jail，加入 telegram 动作..."
+    # 2.2 SSH 登录提醒 action（只发消息，不封 IP）
+    echo "📄 写入 /etc/fail2ban/action.d/telegram-ssh-login.conf ..."
+    cat > /etc/fail2ban/action.d/telegram-ssh-login.conf <<EOF
+[Definition]
+
+actionban = curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+    -d "chat_id=$CHAT_ID" \
+    -d "parse_mode=Markdown" \
+    -d "text=🔐 *SSH 登录提醒*\\n用户: <user>\\nIP: \`<ip>\`\\n主机: *<fq-hostname>*\\n时间: <time>"
+EOF
+
+    # 2.3 SSH 登录提醒 filter（匹配 Accepted password/publickey）
+    echo "📄 写入 /etc/fail2ban/filter.d/sshd-login.conf ..."
+    cat > /etc/fail2ban/filter.d/sshd-login.conf <<'EOF'
+[Definition]
+failregex = ^%(__prefix_line)sAccepted (password|publickey|keyboard-interactive/pam) for (?P<user>\S+) from <HOST> .*$
+
+ignoreregex =
+EOF
+
+    # 2.4 SSH 登录提醒 jail（不封，只通知）
+    echo "📄 写入 /etc/fail2ban/jail.d/sshd-login.local ..."
+    cat > /etc/fail2ban/jail.d/sshd-login.local <<EOF
+[sshd-login]
+enabled  = true
+filter   = sshd-login
+backend  = auto
+logpath  = /var/log/auth.log /var/log/secure
+maxretry = 1
+findtime = 60
+bantime  = 1
+action   = telegram-ssh-login
+EOF
+
+    # 2.5 更新 sshd jail，加上 telegram action（封禁时推送）
+    echo "🛠 修改 [sshd] jail，加入 telegram 封禁告警..."
 
     ACTION=$(get_action_for_firewall)
 
-    # 如果没有 [sshd]，顺便创建一个带 telegram 的
     if ! grep -q "^\[sshd\]" "$JAIL"; then
         cat >> "$JAIL" <<EOF
 
@@ -247,7 +284,6 @@ findtime = 600
 bantime  = 12h
 EOF
     else
-        # 重写 [sshd] 段，统一为带 telegram 的版本
         tmpfile="$(mktemp)"
         awk -v act="$ACTION" '
             BEGIN{in_sshd=0; printed=0}
@@ -273,9 +309,9 @@ EOF
         ' "$JAIL" > "$tmpfile" && mv "$tmpfile" "$JAIL"
     fi
 
-    echo "🔄 重启 Fail2ban 以应用 Telegram 通知..."
+    echo "🔄 重启 Fail2ban 以应用 Telegram 通知与 SSH 登录提醒..."
     if ! systemctl restart fail2ban; then
-        echo "❌ Fail2ban 启动失败，请检查 $JAIL 和 telegram.conf 语法。"
+        echo "❌ Fail2ban 启动失败，请检查 $JAIL 和 telegram*.conf 语法。"
         pause
         return
     fi
@@ -284,7 +320,7 @@ EOF
     echo "📨 发送 Telegram 测试通知..."
     TEST_RESP=$(curl -s --max-time 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
         -d "chat_id=$CHAT_ID" \
-        -d "text=Fail2ban+Telegram+通知对接测试")
+        -d "text=Fail2ban+Telegram+通知对接测试（封禁与SSH登录提醒已启用）")
 
     if echo "$TEST_RESP" | grep -q '"ok":true'; then
         echo "✅ 测试通知已发送，请在 Telegram 中检查是否收到。"
@@ -294,7 +330,93 @@ EOF
     fi
 
     echo ""
-    echo "📌 之后只要有 IP 被 Fail2ban 封禁，都会收到 Telegram 告警。"
+    echo "📌 之后："
+    echo "   - IP 被 Fail2ban 封禁 → 会推送封禁告警"
+    echo "   - 每次 SSH 登录成功 → 会推送登录提醒"
+    pause
+}
+
+#-----------------------------
+# 4. 快捷修改 SSH 防爆破参数
+#-----------------------------
+modify_ssh_params() {
+    if [[ ! -f "$JAIL" ]]; then
+        echo "⚠ 未检测到 $JAIL，请先执行『1) 安装/配置 SSH 防爆破』"
+        pause
+        return
+    fi
+
+    if ! grep -q "^\[sshd\]" "$JAIL"; then
+        echo "⚠ jail.local 中没有 [sshd] 段，请先通过菜单 1 生成。"
+        pause
+        return
+    fi
+
+    # 读取当前参数
+    CURRENT_MAXRETRY=$(awk '
+        BEGIN{in_sshd=0}
+        /^\[sshd\]/{in_sshd=1; next}
+        /^\[.*\]/{if(in_sshd){in_sshd=0}}
+        in_sshd && $1=="maxretry" {print $3}
+    ' "$JAIL" | tail -n1)
+
+    CURRENT_BANTIME=$(awk '
+        BEGIN{in_sshd=0}
+        /^\[sshd\]/{in_sshd=1; next}
+        /^\[.*\]/{if(in_sshd){in_sshd=0}}
+        in_sshd && $1=="bantime" {print $3}
+    ' "$JAIL" | tail -n1)
+
+    [[ -z "$CURRENT_MAXRETRY" ]] && CURRENT_MAXRETRY="（未设置，默认 5）"
+    [[ -z "$CURRENT_BANTIME" ]] && CURRENT_BANTIME="（未设置，默认 12h）"
+
+    echo "================ 快捷修改 SSH 防爆破参数 ================"
+    echo "当前 SSH 配置："
+    echo "  maxretry（失败次数）: $CURRENT_MAXRETRY"
+    echo "  bantime（封禁时长） : $CURRENT_BANTIME"
+    echo "---------------------------------------------------------"
+    echo "留空则表示不修改该项。"
+    echo "bantime 支持格式：600（秒）、12h、1d 等 Fail2ban 支持的时长格式。"
+    echo "========================================================="
+    echo ""
+
+    read -rp "请输入新的 maxretry（失败次数，例：5，留空不改）： " NEW_MAXRETRY
+    read -rp "请输入新的 bantime（封禁时长，例：12h 或 3600，留空不改）： " NEW_BANTIME
+
+    if [[ -z "$NEW_MAXRETRY" && -z "$NEW_BANTIME" ]]; then
+        echo "ℹ️ 未输入任何修改，保持原样。"
+        pause
+        return
+    fi
+
+    # 修改 [sshd] 段中的 maxretry
+    if [[ -n "$NEW_MAXRETRY" ]]; then
+        if ! [[ "$NEW_MAXRETRY" =~ ^[0-9]+$ ]]; then
+            echo "⚠ maxretry 必须是整数，已忽略该项修改。"
+        else
+            sed -i "/^\[sshd\]/,/^\[.*\]/{s/^maxretry[[:space:]]*=.*/maxretry = $NEW_MAXRETRY/}" "$JAIL"
+            echo "✅ 已将 maxretry 修改为：$NEW_MAXRETRY"
+        fi
+    fi
+
+    # 修改 [sshd] 段中的 bantime
+    if [[ -n "$NEW_BANTIME" ]]; then
+        # 不校验格式，交给 fail2ban 自己判断，只要用户写的是合法的时长即可
+        sed -i "/^\[sshd\]/,/^\[.*\]/{s/^bantime[[:space:]]*=.*/bantime = $NEW_BANTIME/}" "$JAIL"
+        echo "✅ 已将 bantime 修改为：$NEW_BANTIME"
+    fi
+
+    echo "🔄 重启 Fail2ban 以应用新参数..."
+    if ! systemctl restart fail2ban; then
+        echo "❌ Fail2ban 启动失败，请检查 $JAIL 是否有语法错误。"
+        pause
+        return
+    fi
+
+    echo ""
+    echo "✅ 修改已生效！当前 SSH jail 状态："
+    fail2ban-client status sshd || true
+    echo ""
     pause
 }
 
@@ -304,24 +426,25 @@ EOF
 uninstall_all() {
     echo "⚠ 此操作将删除："
     echo "   - /etc/fail2ban/jail.local"
+    echo "   - /etc/fail2ban/jail.d/sshd-login.local"
     echo "   - /etc/fail2ban/action.d/telegram.conf"
+    echo "   - /etc/fail2ban/action.d/telegram-ssh-login.conf"
+    echo "   - /etc/fail2ban/filter.d/sshd-login.conf"
     echo "   （不会删除系统自带的 jail.conf 等默认配置）"
     echo ""
     read -rp "确认继续删除这些配置吗？[y/N]: " CONFIRM
     case "$CONFIRM" in
-        y|Y)
-            ;;
-        *)
-            echo "已取消卸载。"
-            pause
-            return
-            ;;
+        y|Y) ;;
+        *)   echo "已取消卸载。"; pause; return ;;
     esac
 
     systemctl stop fail2ban 2>/dev/null || true
 
     rm -f /etc/fail2ban/jail.local
+    rm -f /etc/fail2ban/jail.d/sshd-login.local
     rm -f /etc/fail2ban/action.d/telegram.conf
+    rm -f /etc/fail2ban/action.d/telegram-ssh-login.conf
+    rm -f /etc/fail2ban/filter.d/sshd-login.conf
 
     echo "✅ 配置文件已删除。"
 
@@ -356,29 +479,19 @@ main_menu() {
         echo " Author: DadaGi 大大怪"
         echo "==============================================="
         echo " 1) 安装 / 配置 SSH 防爆破"
-        echo " 2) 对接 TG 通知（BOT 封禁推送）"
+        echo " 2) 对接 TG 通知（封禁+SSH 登录提醒）"
         echo " 3) 卸载本脚本相关配置（可选卸载 fail2ban）"
+        echo " 4) 快捷修改 SSH 防爆破参数（失败次数 / 封禁时长）"
         echo " 0) 退出"
         echo "-----------------------------------------------"
-        read -rp "请输入选项 [0-3]: " CHOICE
+        read -rp "请输入选项 [0-4]: " CHOICE
         case "$CHOICE" in
-            1)
-                install_or_config_ssh
-                ;;
-            2)
-                setup_telegram
-                ;;
-            3)
-                uninstall_all
-                ;;
-            0)
-                echo "已退出。"
-                exit 0
-                ;;
-            *)
-                echo "❌ 无效选项。"
-                pause
-                ;;
+            1) install_or_config_ssh ;;
+            2) setup_telegram ;;
+            3) uninstall_all ;;
+            4) modify_ssh_params ;;
+            0) echo "已退出。"; exit 0 ;;
+            *) echo "❌ 无效选项。"; pause ;;
         esac
     done
 }
