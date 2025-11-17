@@ -9,7 +9,11 @@
 #        - IP 被封禁时推送告警
 #        - SSH 登录成功时推送提醒
 #   3) 卸载本脚本相关配置（可选同时卸载 fail2ban）
-#   4) 快捷修改 SSH 防爆破参数（失败次数 / 封禁时长）
+#   4) 快捷修改 SSH 防爆破参数：
+#        - maxretry（失败次数）
+#        - bantime（封禁时长）
+#        - findtime（检测周期 / 统计时间窗口）
+#   5) 安装 / 更新快捷命令（fb5），一条命令直接打开本面板
 #
 # 说明：
 #   - 只对 [sshd] jail 和 ssh-login 提醒 jail 动手
@@ -24,6 +28,8 @@ set -e
 OS=""
 FIREWALL=""
 JAIL="/etc/fail2ban/jail.local"
+INSTALL_CMD_PATH="/usr/local/bin/fb5"
+REMOTE_URL="https://raw.githubusercontent.com/shini74744/jj/refs/heads/main/fb5.sh"
 
 #-----------------------------
 # 工具函数
@@ -367,23 +373,34 @@ modify_ssh_params() {
         in_sshd && $1=="bantime" {print $3}
     ' "$JAIL" | tail -n1)
 
+    CURRENT_FINDTIME=$(awk '
+        BEGIN{in_sshd=0}
+        /^\[sshd\]/{in_sshd=1; next}
+        /^\[.*\]/{if(in_sshd){in_sshd=0}}
+        in_sshd && $1=="findtime" {print $3}
+    ' "$JAIL" | tail -n1)
+
     [[ -z "$CURRENT_MAXRETRY" ]] && CURRENT_MAXRETRY="（未设置，默认 5）"
     [[ -z "$CURRENT_BANTIME" ]] && CURRENT_BANTIME="（未设置，默认 12h）"
+    [[ -z "$CURRENT_FINDTIME" ]] && CURRENT_FINDTIME="（未设置，默认 600 秒）"
 
     echo "================ 快捷修改 SSH 防爆破参数 ================"
     echo "当前 SSH 配置："
-    echo "  maxretry（失败次数）: $CURRENT_MAXRETRY"
-    echo "  bantime（封禁时长） : $CURRENT_BANTIME"
+    echo "  maxretry（失败次数）   : $CURRENT_MAXRETRY"
+    echo "  bantime（封禁时长）    : $CURRENT_BANTIME"
+    echo "  findtime（检测周期 秒）: $CURRENT_FINDTIME"
     echo "---------------------------------------------------------"
     echo "留空则表示不修改该项。"
     echo "bantime 支持格式：600（秒）、12h、1d 等 Fail2ban 支持的时长格式。"
+    echo "findtime 一般用秒数，比如 600 表示 10 分钟。"
     echo "========================================================="
     echo ""
 
     read -rp "请输入新的 maxretry（失败次数，例：5，留空不改）： " NEW_MAXRETRY
     read -rp "请输入新的 bantime（封禁时长，例：12h 或 3600，留空不改）： " NEW_BANTIME
+    read -rp "请输入新的 findtime（检测周期秒数，例：600，留空不改）： " NEW_FINDTIME
 
-    if [[ -z "$NEW_MAXRETRY" && -z "$NEW_BANTIME" ]]; then
+    if [[ -z "$NEW_MAXRETRY" && -z "$NEW_BANTIME" && -z "$NEW_FINDTIME" ]]; then
         echo "ℹ️ 未输入任何修改，保持原样。"
         pause
         return
@@ -401,9 +418,18 @@ modify_ssh_params() {
 
     # 修改 [sshd] 段中的 bantime
     if [[ -n "$NEW_BANTIME" ]]; then
-        # 不校验格式，交给 fail2ban 自己判断，只要用户写的是合法的时长即可
         sed -i "/^\[sshd\]/,/^\[.*\]/{s/^bantime[[:space:]]*=.*/bantime = $NEW_BANTIME/}" "$JAIL"
         echo "✅ 已将 bantime 修改为：$NEW_BANTIME"
+    fi
+
+    # 修改 [sshd] 段中的 findtime
+    if [[ -n "$NEW_FINDTIME" ]]; then
+        if ! [[ "$NEW_FINDTIME" =~ ^[0-9]+$ ]]; then
+            echo "⚠ findtime 必须是整数秒数，已忽略该项修改。"
+        else
+            sed -i "/^\[sshd\]/,/^\[.*\]/{s/^findtime[[:space:]]*=.*/findtime = $NEW_FINDTIME/}" "$JAIL"
+            echo "✅ 已将 findtime 修改为：$NEW_FINDTIME 秒"
+        fi
     fi
 
     echo "🔄 重启 Fail2ban 以应用新参数..."
@@ -421,6 +447,43 @@ modify_ssh_params() {
 }
 
 #-----------------------------
+# 5. 安装 / 更新快捷命令（fb5）
+#-----------------------------
+install_update_shortcut() {
+    ensure_curl
+    echo "================ 安装 / 更新快捷命令 ================"
+    echo "将本脚本从远程地址："
+    echo "  $REMOTE_URL"
+    echo "下载到固定位置："
+    echo "  $INSTALL_CMD_PATH"
+    echo "并赋予执行权限，之后可直接运行命令：fb5"
+    echo "====================================================="
+    echo ""
+    read -rp "确认安装 / 更新快捷命令 fb5 吗？[y/N]: " CONFIRM
+    case "$CONFIRM" in
+        y|Y) ;;
+        *)   echo "已取消。"; pause; return ;;
+    esac
+
+    mkdir -p "$(dirname "$INSTALL_CMD_PATH")"
+
+    if ! curl -fsSL "$REMOTE_URL" -o "$INSTALL_CMD_PATH"; then
+        echo "❌ 下载失败，请检查网络或仓库地址。"
+        pause
+        return
+    fi
+
+    chmod +x "$INSTALL_CMD_PATH"
+
+    echo ""
+    echo "✅ 已安装 / 更新快捷命令：fb5"
+    echo "👉 以后可以直接在任意目录运行：fb5"
+    echo "   当前这次执行仍然是老版本，下次运行 fb5 即加载新版本脚本。"
+    echo ""
+    pause
+}
+
+#-----------------------------
 # 3. 卸载本脚本相关配置
 #-----------------------------
 uninstall_all() {
@@ -432,10 +495,21 @@ uninstall_all() {
     echo "   - /etc/fail2ban/filter.d/sshd-login.conf"
     echo "   （不会删除系统自带的 jail.conf 等默认配置）"
     echo ""
-    read -rp "确认继续删除这些配置吗？[y/N]: " CONFIRM
+    read -rp "是否同时删除快捷命令 $INSTALL_CMD_PATH ? [y/N]: " RM_CMD
+    case "$RM_CMD" in
+        y|Y)
+            rm -f "$INSTALL_CMD_PATH"
+            echo "✅ 已删除快捷命令：$INSTALL_CMD_PATH"
+            ;;
+        *)
+            echo "已保留快捷命令（如存在）。"
+            ;;
+    esac
+
+    read -rp "确认继续删除上述 Fail2ban 配置吗？[y/N]: " CONFIRM
     case "$CONFIRM" in
         y|Y) ;;
-        *)   echo "已取消卸载。"; pause; return ;;
+        *)   echo "已取消卸载配置。"; pause; return ;;
     esac
 
     systemctl stop fail2ban 2>/dev/null || true
@@ -446,7 +520,7 @@ uninstall_all() {
     rm -f /etc/fail2ban/action.d/telegram-ssh-login.conf
     rm -f /etc/fail2ban/filter.d/sshd-login.conf
 
-    echo "✅ 配置文件已删除。"
+    echo "✅ Fail2ban 相关自定义配置文件已删除。"
 
     read -rp "是否同时卸载 fail2ban 软件包？[y/N]: " CONFIRM2
     case "$CONFIRM2" in
@@ -481,15 +555,17 @@ main_menu() {
         echo " 1) 安装 / 配置 SSH 防爆破"
         echo " 2) 对接 TG 通知（封禁+SSH 登录提醒）"
         echo " 3) 卸载本脚本相关配置（可选卸载 fail2ban）"
-        echo " 4) 快捷修改 SSH 防爆破参数（失败次数 / 封禁时长）"
+        echo " 4) 快捷修改 SSH 防爆破参数（失败次数 / 封禁时长 / 检测周期）"
+        echo " 5) 安装 / 更新快捷命令（fb5，一键打开本面板）"
         echo " 0) 退出"
         echo "-----------------------------------------------"
-        read -rp "请输入选项 [0-4]: " CHOICE
+        read -rp "请输入选项 [0-5]: " CHOICE
         case "$CHOICE" in
             1) install_or_config_ssh ;;
             2) setup_telegram ;;
             3) uninstall_all ;;
             4) modify_ssh_params ;;
+            5) install_update_shortcut ;;
             0) echo "已退出。"; exit 0 ;;
             *) echo "❌ 无效选项。"; pause ;;
         esac
