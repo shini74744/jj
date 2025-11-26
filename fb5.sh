@@ -5,12 +5,12 @@
 #
 # 功能：
 #   1) 安装 / 配置 Fail2ban 仅用于 SSH 防爆破（安装时输入 SSH 端口，回车默认 22）
+#      - 安装完成后自动安装 fb5 命令：/usr/local/bin/fb5（可直接 fb5 打开面板）
 #   2) 卸载本脚本相关配置（可选同时卸载 fail2ban）
-#   3) 快捷修改 SSH 防爆破参数：
-#        - maxretry（失败次数）
-#        - bantime（封禁时长）
-#        - findtime（检测周期 / 统计时间窗口）
-#   4) 安装 / 更新快捷命令（fb5），一条命令直接打开本面板
+#   3) 快捷修改 SSH 防爆破参数（maxretry / bantime / findtime）
+#   4) 从远程更新 fb5 脚本（仅更新功能：下载覆盖并赋权）
+#   5) 查看当前封禁 IP 列表（sshd jail）
+#   6) 解禁指定 IP（sshd jail）
 #
 # 默认策略（首次安装 / 无 [sshd] 参数时）：
 #   - maxretry = 3
@@ -19,7 +19,6 @@
 #
 # 说明：
 #   - 只对 [sshd] jail 动手
-#   - 可反复执行：若已存在 [sshd]，会按当前选择的 SSH 端口 + 当前参数(如能读取)进行更新
 # ============================================================
 
 set -e
@@ -96,13 +95,10 @@ get_action_for_firewall() {
 }
 
 pick_ssh_logpath() {
-    # 尽量选择存在的日志文件，避免 jail 启动时报 “log file not found”
     local paths=()
     [[ -f /var/log/auth.log ]] && paths+=("/var/log/auth.log")
     [[ -f /var/log/secure ]] && paths+=("/var/log/secure")
-
     if (( ${#paths[@]} == 0 )); then
-        # 兜底：仍写两个常见路径（某些系统虽不存在文件但会后续生成）
         echo "/var/log/auth.log /var/log/secure"
         return
     fi
@@ -114,20 +110,16 @@ prompt_ssh_port() {
     while true; do
         read -rp "请输入 SSH 端口号（回车默认 22）: " p
         if [[ -z "$p" ]]; then
-            echo "22"
-            return
+            echo "22"; return
         fi
         if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); then
-            echo "$p"
-            return
+            echo "$p"; return
         fi
         echo "⚠ 端口号无效，请输入 1-65535 的整数，或直接回车默认 22。"
     done
 }
 
 get_sshd_value() {
-    # 用法：get_sshd_value key
-    # 从 [sshd] 段读取配置，如 port/maxretry/findtime/bantime/action/logpath
     local key="$1"
     awk -v k="$key" '
         BEGIN{in_sshd=0}
@@ -138,7 +130,6 @@ get_sshd_value() {
 }
 
 rewrite_or_append_sshd_block() {
-    # 参数：port action logpath maxretry findtime bantime
     local port="$1"
     local action="$2"
     local logpath="$3"
@@ -194,6 +185,121 @@ EOF
 }
 
 #-----------------------------
+# fb5 安装（本地自安装优先，失败则远程下载兜底）
+#-----------------------------
+install_fb5_now() {
+    mkdir -p "$(dirname "$INSTALL_CMD_PATH")"
+
+    local src="$0"
+    if command -v readlink &>/dev/null; then
+        src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    fi
+
+    if [[ -f "$src" ]]; then
+        cp -f "$src" "$INSTALL_CMD_PATH"
+        chmod +x "$INSTALL_CMD_PATH"
+        echo "✅ 已安装 fb5 命令：$INSTALL_CMD_PATH（来源：当前脚本）"
+        return 0
+    fi
+
+    ensure_curl
+    if curl -fsSL "$REMOTE_URL" -o "$INSTALL_CMD_PATH"; then
+        chmod +x "$INSTALL_CMD_PATH"
+        echo "✅ 已安装 fb5 命令：$INSTALL_CMD_PATH（来源：远程下载）"
+        return 0
+    fi
+
+    echo "⚠ fb5 安装失败：无法从当前脚本复制，也无法从远程下载。"
+    echo "   你可以稍后在菜单 4 再次执行远程更新。"
+    return 1
+}
+
+#-----------------------------
+# Fail2ban 状态检查（用于 5/6）
+#-----------------------------
+ensure_fail2ban_ready() {
+    if ! command -v fail2ban-client &>/dev/null; then
+        echo "❌ 未检测到 fail2ban-client（Fail2ban 可能未安装）。"
+        return 1
+    fi
+    if command -v systemctl &>/dev/null; then
+        if ! systemctl is-active --quiet fail2ban; then
+            echo "❌ Fail2ban 当前未运行（fail2ban 服务未 active）。"
+            echo "   可尝试：systemctl restart fail2ban"
+            return 1
+        fi
+    fi
+    if ! fail2ban-client status sshd &>/dev/null; then
+        echo "❌ sshd jail 未启用或无法查询。"
+        echo "   请先执行菜单 1 安装/配置 SSH 防爆破。"
+        return 1
+    fi
+    return 0
+}
+
+#-----------------------------
+# 5. 查看封禁 IP（sshd）
+#-----------------------------
+view_banned_ips() {
+    if ! ensure_fail2ban_ready; then
+        pause
+        return
+    fi
+    echo "================ sshd 当前封禁 IP ================"
+    # 优先用 get banip（更干净），失败则 fallback status
+    if fail2ban-client get sshd banip &>/dev/null; then
+        local ips
+        ips="$(fail2ban-client get sshd banip | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+        if [[ -z "$ips" ]]; then
+            echo "✅ 当前无封禁 IP"
+        else
+            echo "$ips" | tr ' ' '\n'
+        fi
+    else
+        echo "（当前 fail2ban-client 不支持 get banip，改用 status 输出）"
+        fail2ban-client status sshd || true
+    fi
+    echo "=================================================="
+    echo ""
+    pause
+}
+
+#-----------------------------
+# 6. 解禁指定 IP（sshd）
+#-----------------------------
+unban_ip() {
+    if ! ensure_fail2ban_ready; then
+        pause
+        return
+    fi
+
+    local ip=""
+    read -rp "请输入要解禁的 IP（IPv4/IPv6，回车取消）: " ip
+    if [[ -z "$ip" ]]; then
+        echo "已取消。"
+        pause
+        return
+    fi
+
+    # 轻度校验：禁止空格/奇怪字符（允许 IPv6 冒号）
+    if [[ "$ip" =~ [[:space:]] ]] || ! [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
+        echo "⚠ IP 格式看起来不正确：$ip"
+        pause
+        return
+    fi
+
+    if fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1; then
+        echo "✅ 已解禁：$ip"
+    else
+        echo "❌ 解禁失败：$ip"
+        echo "   可能原因：该 IP 不在封禁列表中，或 fail2ban 运行异常。"
+    fi
+
+    echo ""
+    pause
+}
+
+#-----------------------------
 # 状态总览：面板状态 / 开机启动 / jail 状态
 #-----------------------------
 print_status_summary() {
@@ -237,16 +343,20 @@ print_status_summary() {
         [[ -z "$show_port" ]] && show_port="—"
     fi
 
+    local fb5_status="未安装"
+    [[ -x "$INSTALL_CMD_PATH" ]] && fb5_status="已安装($INSTALL_CMD_PATH)"
+
     echo "面板状态: $fb_status"
     echo "开机启动: $fb_enabled"
     echo "SSH 防爆破 (sshd): $sshd_jail"
     echo "SSH 端口(记录于 fail2ban): $show_port"
+    echo "快捷命令: $fb5_status"
     echo "------------------------------------------------"
     echo ""
 }
 
 #-----------------------------
-# 1. 安装 / 配置 SSH 防爆破
+# 1. 安装 / 配置 SSH 防爆破（结束自动安装 fb5）
 #-----------------------------
 install_or_config_ssh() {
     detect_os
@@ -273,7 +383,6 @@ install_or_config_ssh() {
     echo "📁 确保 /etc/fail2ban 目录存在..."
     mkdir -p /etc/fail2ban
 
-    # 创建 jail.local 基础配置（仅当文件不存在）
     if [[ ! -f "$JAIL" ]]; then
         echo "📄 创建新的 jail.local..."
         local MYIP="127.0.0.1"
@@ -281,7 +390,6 @@ install_or_config_ssh() {
         TMPIP=$(curl -s --max-time 5 https://api.ipify.org || true)
         [[ -n "$TMPIP" ]] && MYIP="$TMPIP"
 
-        # ✅ 这里改成你要的默认：maxretry=3, findtime=6h, bantime=12h
         cat > "$JAIL" <<EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 $MYIP
@@ -294,10 +402,9 @@ EOF
     local ACTION
     ACTION="$(get_action_for_firewall)"
 
-    # ✅ 这里是 [sshd] 段的默认回退值（第一次安装/读取不到时真正生效）
     local CUR_MAXRETRY CUR_FINDTIME CUR_BANTIME
     CUR_MAXRETRY="$(get_sshd_value maxretry)"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="3"
-    CUR_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="21600"   # 6小时
+    CUR_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="21600"
     CUR_BANTIME="$(get_sshd_value bantime)";  [[ -z "$CUR_BANTIME"  ]] && CUR_BANTIME="12h"
 
     local LOGPATH
@@ -317,60 +424,14 @@ EOF
     echo ""
     echo "✅ SSH 防爆破配置完成！"
     echo ""
+    echo "🔧 正在安装快捷命令 fb5..."
+    install_fb5_now || true
+
+    echo ""
     print_status_summary
     echo "📌 查看详细状态：fail2ban-client status sshd"
+    echo "📌 立即可用命令：fb5"
     echo ""
-    pause
-}
-
-#-----------------------------
-# 3. 卸载本脚本相关配置
-#-----------------------------
-uninstall_all() {
-    echo "⚠ 此操作将删除："
-    echo "   - /etc/fail2ban/jail.local（若存在，会直接删除整个文件）"
-    echo "   （不会删除系统自带的 jail.conf 等默认配置）"
-    echo ""
-    read -rp "是否同时删除快捷命令 $INSTALL_CMD_PATH ? [y/N]: " RM_CMD
-    case "$RM_CMD" in
-        y|Y)
-            rm -f "$INSTALL_CMD_PATH"
-            echo "✅ 已删除快捷命令：$INSTALL_CMD_PATH"
-            ;;
-        *)
-            echo "已保留快捷命令（如存在）。"
-            ;;
-    esac
-
-    read -rp "确认继续删除上述 Fail2ban 配置吗？[y/N]: " CONFIRM
-    case "$CONFIRM" in
-        y|Y) ;;
-        *)   echo "已取消卸载配置。"; pause; return ;;
-    esac
-
-    systemctl stop fail2ban 2>/dev/null || true
-
-    rm -f /etc/fail2ban/jail.local
-
-    echo "✅ Fail2ban 自定义配置文件已删除。"
-
-    read -rp "是否同时卸载 fail2ban 软件包？[y/N]: " CONFIRM2
-    case "$CONFIRM2" in
-        y|Y)
-            detect_os
-            if [[ $OS == "centos" ]]; then
-                yum remove -y fail2ban || true
-            else
-                apt-get purge -y fail2ban || true
-            fi
-            systemctl disable fail2ban 2>/dev/null || true
-            echo "✅ fail2ban 软件包已卸载。"
-            ;;
-        *)
-            echo "已保留 fail2ban 软件包（但已无自定义配置）。"
-            ;;
-    esac
-
     pause
 }
 
@@ -447,7 +508,6 @@ modify_ssh_params() {
         fi
     fi
 
-    # 读取并保留 action/logpath
     local ACTION LOGPATH
     ACTION="$(get_sshd_value action)"
     [[ -z "$ACTION" ]] && ACTION="$(get_action_for_firewall)"
@@ -478,38 +538,83 @@ modify_ssh_params() {
 }
 
 #-----------------------------
-# 4. 安装 / 更新快捷命令（fb5）
+# 3. 卸载本脚本相关配置
 #-----------------------------
-install_update_shortcut() {
-    ensure_curl
-    echo "================ 安装 / 更新快捷命令 ================"
-    echo "将本脚本从远程地址："
-    echo "  $REMOTE_URL"
-    echo "下载到固定位置："
-    echo "  $INSTALL_CMD_PATH"
-    echo "并赋予执行权限，之后可直接运行命令：fb5"
-    echo "====================================================="
+uninstall_all() {
+    echo "⚠ 此操作将删除："
+    echo "   - /etc/fail2ban/jail.local（若存在，会直接删除整个文件）"
+    echo "   （不会删除系统自带的 jail.conf 等默认配置）"
     echo ""
-    read -rp "确认安装 / 更新快捷命令 fb5 吗？[y/N]: " CONFIRM
+    read -rp "是否同时删除快捷命令 $INSTALL_CMD_PATH ? [y/N]: " RM_CMD
+    case "$RM_CMD" in
+        y|Y)
+            rm -f "$INSTALL_CMD_PATH"
+            echo "✅ 已删除快捷命令：$INSTALL_CMD_PATH"
+            ;;
+        *)
+            echo "已保留快捷命令（如存在）。"
+            ;;
+    esac
+
+    read -rp "确认继续删除上述 Fail2ban 配置吗？[y/N]: " CONFIRM
+    case "$CONFIRM" in
+        y|Y) ;;
+        *)   echo "已取消卸载配置。"; pause; return ;;
+    esac
+
+    systemctl stop fail2ban 2>/dev/null || true
+    rm -f /etc/fail2ban/jail.local
+    echo "✅ Fail2ban 自定义配置文件已删除。"
+
+    read -rp "是否同时卸载 fail2ban 软件包？[y/N]: " CONFIRM2
+    case "$CONFIRM2" in
+        y|Y)
+            detect_os
+            if [[ $OS == "centos" ]]; then
+                yum remove -y fail2ban || true
+            else
+                apt-get purge -y fail2ban || true
+            fi
+            systemctl disable fail2ban 2>/dev/null || true
+            echo "✅ fail2ban 软件包已卸载。"
+            ;;
+        *)
+            echo "已保留 fail2ban 软件包（但已无自定义配置）。"
+            ;;
+    esac
+
+    pause
+}
+
+#-----------------------------
+# 4. 从远程更新 fb5（仅更新功能）
+#-----------------------------
+update_fb5_from_remote() {
+    ensure_curl
+    echo "================ 远程更新 fb5 脚本 ================"
+    echo "将从远程地址："
+    echo "  $REMOTE_URL"
+    echo "下载并覆盖到："
+    echo "  $INSTALL_CMD_PATH"
+    echo "然后赋予执行权限（chmod +x）"
+    echo "===================================================="
+    echo ""
+    read -rp "确认进行远程更新吗？[y/N]: " CONFIRM
     case "$CONFIRM" in
         y|Y) ;;
         *)   echo "已取消。"; pause; return ;;
     esac
 
     mkdir -p "$(dirname "$INSTALL_CMD_PATH")"
-
     if ! curl -fsSL "$REMOTE_URL" -o "$INSTALL_CMD_PATH"; then
-        echo "❌ 下载失败，请检查网络或仓库地址。"
+        echo "❌ 远程更新失败，请检查网络或仓库地址是否可访问。"
         pause
         return
     fi
 
     chmod +x "$INSTALL_CMD_PATH"
-
-    echo ""
-    echo "✅ 已安装 / 更新快捷命令：fb5"
-    echo "👉 以后可以直接在任意目录运行：fb5"
-    echo "   注意：fb5 下载的是 REMOTE_URL 指向的脚本内容，请确保仓库里也是最新版。"
+    echo "✅ 更新完成：$INSTALL_CMD_PATH"
+    echo "👉 现在可直接运行：fb5"
     echo ""
     pause
 }
@@ -525,18 +630,22 @@ main_menu() {
         echo " Author: DadaGi 大大怪"
         echo "==============================================="
         print_status_summary
-        echo " 1) 安装 / 配置 SSH 防爆破（安装时输入 SSH 端口，回车默认 22）"
+        echo " 1) 安装 / 配置 SSH 防爆破（结束自动安装 fb5 命令）"
         echo " 2) 快捷修改 SSH 防爆破参数（失败次数 / 封禁时长 / 检测周期）"
         echo " 3) 卸载本脚本相关配置（可选卸载 fail2ban）"
-        echo " 4) 安装 / 更新快捷命令（fb5，一键打开本面板）"
+        echo " 4) 远程更新 fb5 脚本（仅更新功能）"
+        echo " 5) 查看 sshd 封禁 IP 列表"
+        echo " 6) 解禁指定 IP（sshd）"
         echo " 0) 退出"
         echo "-----------------------------------------------"
-        read -rp "请输入选项 [0-4]: " CHOICE
+        read -rp "请输入选项 [0-6]: " CHOICE
         case "$CHOICE" in
             1) install_or_config_ssh ;;
             2) modify_ssh_params ;;
             3) uninstall_all ;;
-            4) install_update_shortcut ;;
+            4) update_fb5_from_remote ;;
+            5) view_banned_ips ;;
+            6) unban_ip ;;
             0) echo "已退出。"; exit 0 ;;
             *) echo "❌ 无效选项。"; pause ;;
         esac
