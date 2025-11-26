@@ -12,6 +12,11 @@
 #        - findtime（检测周期 / 统计时间窗口）
 #   4) 安装 / 更新快捷命令（fb5），一条命令直接打开本面板
 #
+# 默认策略（首次安装 / 无 [sshd] 参数时）：
+#   - maxretry = 3
+#   - findtime = 21600（6小时）
+#   - bantime  = 12h
+#
 # 说明：
 #   - 只对 [sshd] jail 动手
 #   - 可反复执行：若已存在 [sshd]，会按当前选择的 SSH 端口 + 当前参数(如能读取)进行更新
@@ -276,22 +281,23 @@ install_or_config_ssh() {
         TMPIP=$(curl -s --max-time 5 https://api.ipify.org || true)
         [[ -n "$TMPIP" ]] && MYIP="$TMPIP"
 
+        # ✅ 这里改成你要的默认：maxretry=3, findtime=6h, bantime=12h
         cat > "$JAIL" <<EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 $MYIP
 bantime  = 12h
-findtime = 30m
-maxretry = 5
+findtime = 6h
+maxretry = 3
 EOF
     fi
 
     local ACTION
     ACTION="$(get_action_for_firewall)"
 
-    # 继承已有参数（若存在），否则用默认
+    # ✅ 这里是 [sshd] 段的默认回退值（第一次安装/读取不到时真正生效）
     local CUR_MAXRETRY CUR_FINDTIME CUR_BANTIME
-    CUR_MAXRETRY="$(get_sshd_value maxretry)"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="5"
-    CUR_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="600"
+    CUR_MAXRETRY="$(get_sshd_value maxretry)"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="3"
+    CUR_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="21600"   # 6小时
     CUR_BANTIME="$(get_sshd_value bantime)";  [[ -z "$CUR_BANTIME"  ]] && CUR_BANTIME="12h"
 
     local LOGPATH
@@ -385,9 +391,9 @@ modify_ssh_params() {
     fi
 
     local CURRENT_MAXRETRY CURRENT_BANTIME CURRENT_FINDTIME CURRENT_PORT
-    CURRENT_MAXRETRY="$(get_sshd_value maxretry)"; [[ -z "$CURRENT_MAXRETRY" ]] && CURRENT_MAXRETRY="5"
+    CURRENT_MAXRETRY="$(get_sshd_value maxretry)"; [[ -z "$CURRENT_MAXRETRY" ]] && CURRENT_MAXRETRY="3"
     CURRENT_BANTIME="$(get_sshd_value bantime)";  [[ -z "$CURRENT_BANTIME"  ]] && CURRENT_BANTIME="12h"
-    CURRENT_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CURRENT_FINDTIME" ]] && CURRENT_FINDTIME="600"
+    CURRENT_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CURRENT_FINDTIME" ]] && CURRENT_FINDTIME="21600"
     CURRENT_PORT="$(get_sshd_value port)"; [[ -z "$CURRENT_PORT" ]] && CURRENT_PORT="22"
 
     echo "================ 快捷修改 SSH 防爆破参数 ================"
@@ -399,13 +405,13 @@ modify_ssh_params() {
     echo "---------------------------------------------------------"
     echo "留空则表示不修改该项。"
     echo "bantime 支持格式：600（秒）、12h、1d 等 Fail2ban 支持的时长格式。"
-    echo "findtime 一般用秒数，比如 600 表示 10 分钟。"
+    echo "findtime 用秒数，比如 21600 表示 6 小时。"
     echo "========================================================="
     echo ""
 
-    read -rp "请输入新的 maxretry（失败次数，例：5，留空不改）： " NEW_MAXRETRY
+    read -rp "请输入新的 maxretry（失败次数，例：3，留空不改）： " NEW_MAXRETRY
     read -rp "请输入新的 bantime（封禁时长，例：12h 或 3600，留空不改）： " NEW_BANTIME
-    read -rp "请输入新的 findtime（检测周期秒数，例：600，留空不改）： " NEW_FINDTIME
+    read -rp "请输入新的 findtime（检测周期秒数，例：21600，留空不改）： " NEW_FINDTIME
 
     if [[ -z "$NEW_MAXRETRY" && -z "$NEW_BANTIME" && -z "$NEW_FINDTIME" ]]; then
         echo "ℹ️ 未输入任何修改，保持原样。"
