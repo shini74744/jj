@@ -5,6 +5,7 @@
 #
 # 功能：
 #   1) 安装 / 配置 Fail2ban 仅用于 SSH 防爆破（安装时输入 SSH 端口，回车默认 22）
+#      - 自动把当前 SSH 来源公网 IP 加入 ignoreip 白名单（避免误封自己）
 #      - 安装完成后自动安装 fb5 命令：/usr/local/bin/fb5（可直接 fb5 打开面板）
 #   2) 卸载本脚本相关配置（可选同时卸载 fail2ban）
 #   3) 快捷修改 SSH 防爆破参数（maxretry / bantime / findtime）
@@ -185,6 +186,99 @@ EOF
 }
 
 #-----------------------------
+# 自动获取当前 SSH 来源 IP，并加入 ignoreip 白名单
+#-----------------------------
+get_current_ssh_client_ip() {
+    # SSH_CONNECTION: "clientip clientport serverip serverport"
+    if [[ -n "${SSH_CONNECTION-}" ]]; then
+        awk '{print $1}' <<<"$SSH_CONNECTION"
+        return 0
+    fi
+    # SSH_CLIENT: "clientip clientport serverport"
+    if [[ -n "${SSH_CLIENT-}" ]]; then
+        awk '{print $1}' <<<"$SSH_CLIENT"
+        return 0
+    fi
+    return 1
+}
+
+add_ip_to_ignoreip() {
+    local ip="$1"
+    [[ -z "$ip" ]] && return 1
+
+    # 轻度校验（允许 IPv6 冒号）
+    if [[ "$ip" =~ [[:space:]] ]] || ! [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
+        echo "⚠ 检测到的来源 IP 看起来不合法，跳过白名单：$ip"
+        return 1
+    fi
+
+    mkdir -p /etc/fail2ban
+
+    # 如果 jail.local 不存在，先创建一个最小 [DEFAULT]，后续菜单1还会补齐默认参数
+    if [[ ! -f "$JAIL" ]]; then
+        cat > "$JAIL" <<EOF
+[DEFAULT]
+ignoreip = 127.0.0.1/8 $ip
+EOF
+        echo "✅ 已将当前 SSH 来源 IP 加入 ignoreip 白名单：$ip"
+        return 0
+    fi
+
+    # 如果没有 [DEFAULT] 段，就加到文件顶部
+    if ! grep -q "^\[DEFAULT\]" "$JAIL"; then
+        local tmpf
+        tmpf="$(mktemp)"
+        {
+            echo "[DEFAULT]"
+            echo "ignoreip = 127.0.0.1/8 $ip"
+            echo ""
+            cat "$JAIL"
+        } > "$tmpf" && mv "$tmpf" "$JAIL"
+        echo "✅ 已将当前 SSH 来源 IP 加入 ignoreip 白名单：$ip"
+        return 0
+    fi
+
+    # 在 [DEFAULT] 段内：若有 ignoreip 行则追加；没有则插入一行
+    local tmpfile
+    tmpfile="$(mktemp)"
+    awk -v ip="$ip" '
+        function has_ip(line, x){
+            return (index(" " line " ", " " x " ") > 0)
+        }
+        BEGIN{in_def=0; has_ignore=0}
+        /^\[DEFAULT\]$/ {in_def=1; print; next}
+        /^\[/ && $0 !~ /^\[DEFAULT\]$/ {
+            if(in_def && has_ignore==0){
+                print "ignoreip = 127.0.0.1/8 " ip
+            }
+            in_def=0
+            print
+            next
+        }
+        {
+            if(in_def && $0 ~ /^ignoreip[[:space:]]*=/){
+                has_ignore=1
+                if(has_ip($0, ip)){
+                    print
+                } else {
+                    print $0 " " ip
+                }
+                next
+            }
+            print
+        }
+        END{
+            if(in_def && has_ignore==0){
+                print "ignoreip = 127.0.0.1/8 " ip
+            }
+        }
+    ' "$JAIL" > "$tmpfile" && mv "$tmpfile" "$JAIL"
+
+    echo "✅ 已将当前 SSH 来源 IP 加入/确认在 ignoreip 白名单：$ip"
+    return 0
+}
+
+#-----------------------------
 # fb5 安装（本地自安装优先，失败则远程下载兜底）
 #-----------------------------
 install_fb5_now() {
@@ -246,7 +340,6 @@ view_banned_ips() {
         return
     fi
     echo "================ sshd 当前封禁 IP ================"
-    # 优先用 get banip（更干净），失败则 fallback status
     if fail2ban-client get sshd banip &>/dev/null; then
         local ips
         ips="$(fail2ban-client get sshd banip | tr -s ' ' | sed 's/^ *//;s/ *$//')"
@@ -281,7 +374,6 @@ unban_ip() {
         return
     fi
 
-    # 轻度校验：禁止空格/奇怪字符（允许 IPv6 冒号）
     if [[ "$ip" =~ [[:space:]] ]] || ! [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
         echo "⚠ IP 格式看起来不正确：$ip"
         pause
@@ -356,7 +448,7 @@ print_status_summary() {
 }
 
 #-----------------------------
-# 1. 安装 / 配置 SSH 防爆破（结束自动安装 fb5）
+# 1. 安装 / 配置 SSH 防爆破（结束自动安装 fb5 + 自动白名单当前 SSH 来源 IP）
 #-----------------------------
 install_or_config_ssh() {
     detect_os
@@ -371,7 +463,6 @@ install_or_config_ssh() {
     SSH_PORT="$(prompt_ssh_port)"
 
     echo "📦 检查并安装 Fail2ban..."
-
     if [[ $OS == "centos" ]]; then
         yum install -y epel-release >/dev/null 2>&1 || true
         yum install -y fail2ban fail2ban-firewalld >/dev/null 2>&1 || yum install -y fail2ban -y
@@ -383,6 +474,7 @@ install_or_config_ssh() {
     echo "📁 确保 /etc/fail2ban 目录存在..."
     mkdir -p /etc/fail2ban
 
+    # 创建 jail.local 基础配置（仅当文件不存在）
     if [[ ! -f "$JAIL" ]]; then
         echo "📄 创建新的 jail.local..."
         local MYIP="127.0.0.1"
@@ -397,6 +489,16 @@ bantime  = 12h
 findtime = 6h
 maxretry = 3
 EOF
+    fi
+
+    # ✅ 自动把当前 SSH 来源 IP 加入 ignoreip 白名单
+    local CUR_SSH_IP=""
+    CUR_SSH_IP="$(get_current_ssh_client_ip 2>/dev/null || true)"
+    if [[ -n "$CUR_SSH_IP" ]]; then
+        echo "🧾 检测到当前 SSH 来源 IP：$CUR_SSH_IP"
+        add_ip_to_ignoreip "$CUR_SSH_IP" || true
+    else
+        echo "ℹ️ 未检测到 SSH 环境变量（可能是控制台执行），跳过自动白名单。"
     fi
 
     local ACTION
@@ -527,12 +629,6 @@ modify_ssh_params() {
     echo ""
     echo "✅ 修改已生效！"
     print_status_summary
-    echo "📌 当前 SSH jail 详细状态："
-    if systemctl is-active --quiet fail2ban; then
-        fail2ban-client status sshd || echo "  (fail2ban 已运行，但 sshd jail 查询失败)"
-    else
-        echo "  fail2ban 未运行，无法获取 sshd jail 状态。"
-    fi
     echo ""
     pause
 }
@@ -543,17 +639,11 @@ modify_ssh_params() {
 uninstall_all() {
     echo "⚠ 此操作将删除："
     echo "   - /etc/fail2ban/jail.local（若存在，会直接删除整个文件）"
-    echo "   （不会删除系统自带的 jail.conf 等默认配置）"
     echo ""
     read -rp "是否同时删除快捷命令 $INSTALL_CMD_PATH ? [y/N]: " RM_CMD
     case "$RM_CMD" in
-        y|Y)
-            rm -f "$INSTALL_CMD_PATH"
-            echo "✅ 已删除快捷命令：$INSTALL_CMD_PATH"
-            ;;
-        *)
-            echo "已保留快捷命令（如存在）。"
-            ;;
+        y|Y) rm -f "$INSTALL_CMD_PATH"; echo "✅ 已删除快捷命令：$INSTALL_CMD_PATH" ;;
+        *)   echo "已保留快捷命令（如存在）。" ;;
     esac
 
     read -rp "确认继续删除上述 Fail2ban 配置吗？[y/N]: " CONFIRM
@@ -578,9 +668,7 @@ uninstall_all() {
             systemctl disable fail2ban 2>/dev/null || true
             echo "✅ fail2ban 软件包已卸载。"
             ;;
-        *)
-            echo "已保留 fail2ban 软件包（但已无自定义配置）。"
-            ;;
+        *)  echo "已保留 fail2ban 软件包（但已无自定义配置）。" ;;
     esac
 
     pause
@@ -596,7 +684,6 @@ update_fb5_from_remote() {
     echo "  $REMOTE_URL"
     echo "下载并覆盖到："
     echo "  $INSTALL_CMD_PATH"
-    echo "然后赋予执行权限（chmod +x）"
     echo "===================================================="
     echo ""
     read -rp "确认进行远程更新吗？[y/N]: " CONFIRM
@@ -630,7 +717,7 @@ main_menu() {
         echo " Author: DadaGi 大大怪"
         echo "==============================================="
         print_status_summary
-        echo " 1) 安装 / 配置 SSH 防爆破（结束自动安装 fb5 命令）"
+        echo " 1) 安装 / 配置 SSH 防爆破（自动白名单当前 SSH IP + 自动安装 fb5）"
         echo " 2) 快捷修改 SSH 防爆破参数（失败次数 / 封禁时长 / 检测周期）"
         echo " 3) 卸载本脚本相关配置（可选卸载 fail2ban）"
         echo " 4) 远程更新 fb5 脚本（仅更新功能）"
@@ -652,8 +739,5 @@ main_menu() {
     done
 }
 
-#-----------------------------
-# 脚本入口
-#-----------------------------
 ensure_root
 main_menu
