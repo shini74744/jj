@@ -469,6 +469,20 @@ install_or_config_ssh() {
         return
     fi
 
+    # 提示用户输入 SSH 端口，默认是 22
+    local SSH_PORT=""
+    while true; do
+        read -rp "请输入 SSH 端口号（回车默认 22）: " SSH_PORT
+        if [[ -z "$SSH_PORT" ]]; then
+            SSH_PORT="22"  # 默认使用 22
+            break
+        elif [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )); then
+            break
+        else
+            echo "⚠ 端口号无效，请输入 1-65535 之间的整数，或直接回车默认 22。"
+        fi
+    done
+
     # 检查 Fail2ban 是否已经安装
     echo "📦 检查 Fail2ban 是否已安装..."
     if command -v fail2ban-client &>/dev/null; then
