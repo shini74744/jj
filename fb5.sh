@@ -459,16 +459,28 @@ install_or_config_ssh() {
     echo "🛡 防火墙: $FIREWALL"
     echo ""
 
-    local SSH_PORT
-    SSH_PORT="$(prompt_ssh_port)"
-
-    echo "📦 检查并安装 Fail2ban..."
-    if [[ $OS == "centos" ]]; then
-        yum install -y epel-release >/dev/null 2>&1 || true
-        yum install -y fail2ban fail2ban-firewalld >/dev/null 2>&1 || yum install -y fail2ban -y
+    # 修复 dpkg 错误（如果有）
+    echo "📦 检查并修复 dpkg 错误..."
+    if dpkg --configure -a; then
+        echo "✅ dpkg 修复成功！"
     else
-        apt-get update
-        apt-get install -y fail2ban
+        echo "⚠ dpkg 修复失败，可能需要手动检查并修复。"
+        pause
+        return
+    fi
+
+    # 检查 Fail2ban 是否已经安装
+    echo "📦 检查 Fail2ban 是否已安装..."
+    if command -v fail2ban-client &>/dev/null; then
+        echo "✅ Fail2ban 已安装，跳过安装步骤。"
+    else
+        echo "📦 安装 Fail2ban..."
+        if [[ $OS == "centos" ]]; then
+            yum install -y epel-release >/dev/null 2>&1 || true
+            yum install -y fail2ban fail2ban-firewalld >/dev/null 2>&1 || yum install -y fail2ban -y
+        else
+            apt-get update && apt-get install -y fail2ban
+        fi
     fi
 
     echo "📁 确保 /etc/fail2ban 目录存在..."
