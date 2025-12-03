@@ -459,12 +459,30 @@ install_or_config_ssh() {
     echo "🛡 防火墙: $FIREWALL"
     echo ""
 
-    # 修复 dpkg 错误（如果有）
-    echo "📦 检查并修复 dpkg 错误..."
-    if dpkg --configure -a; then
-        echo "✅ dpkg 修复成功！"
+    # 自动修复系统包管理器错误
+    echo "📦 检查并修复包管理器错误..."
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        # 针对 Debian/Ubuntu 系统
+        echo "✅ 系统为 Debian/Ubuntu，使用 dpkg 修复..."
+        if dpkg --configure -a; then
+            echo "✅ dpkg 修复成功！"
+        else
+            echo "⚠ dpkg 修复失败，可能需要手动检查并修复。"
+            pause
+            return
+        fi
+    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "fedora" ]]; then
+        # 针对 CentOS/RHEL/Fedora 系统
+        echo "✅ 系统为 CentOS/RHEL/Fedora，使用 yum 修复..."
+        if yum-complete-transaction; then
+            echo "✅ yum 修复成功！"
+        else
+            echo "⚠ yum 修复失败，可能需要手动检查并修复。"
+            pause
+            return
+        fi
     else
-        echo "⚠ dpkg 修复失败，可能需要手动检查并修复。"
+        echo "⚠ 不支持的操作系统，无法自动修复包管理器错误。"
         pause
         return
     fi
