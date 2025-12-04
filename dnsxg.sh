@@ -16,9 +16,22 @@ fi
 if systemctl is-active --quiet systemd-resolved; then
     echo "系统使用 systemd-resolved 配置。正在修改 /etc/systemd/resolved.conf 中的DNS设置..."
     
-    # 清理重复的 DNS 配置，确保只修改一次
-    sudo sed -i "/^DNS=/c\DNS=${dns_array[0]}" /etc/systemd/resolved.conf
-    sudo sed -i "/^FallbackDNS=/c\FallbackDNS=1.1.1.1 8.8.8.8" /etc/systemd/resolved.conf
+    # 检查 /etc/systemd/resolved.conf 中是否已存在 DNS 和 FallbackDNS 配置
+    if grep -q "^DNS=" /etc/systemd/resolved.conf; then
+        # 如果已存在 DNS 配置，更新 DNS
+        sudo sed -i "/^DNS=/c\DNS=${dns_array[0]}" /etc/systemd/resolved.conf
+    else
+        # 如果没有 DNS 配置，添加 DNS
+        sudo sed -i "/\[Resolve\]/a DNS=${dns_array[0]}" /etc/systemd/resolved.conf
+    fi
+
+    if grep -q "^FallbackDNS=" /etc/systemd/resolved.conf; then
+        # 如果已存在 FallbackDNS 配置，更新 FallbackDNS
+        sudo sed -i "/^FallbackDNS=/c\FallbackDNS=1.1.1.1 8.8.8.8" /etc/systemd/resolved.conf
+    else
+        # 如果没有 FallbackDNS 配置，添加 FallbackDNS
+        sudo sed -i "/\[Resolve\]/a FallbackDNS=1.1.1.1 8.8.8.8" /etc/systemd/resolved.conf
+    fi
     
     # 重启 systemd-resolved 服务
     sudo systemctl restart systemd-resolved
