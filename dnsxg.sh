@@ -36,15 +36,18 @@ fi
 # 检查 systemd 是否启用 systemd-resolved
 if systemctl is-active --quiet systemd-resolved; then
     echo "系统使用 systemd-resolved 配置。正在修改 /etc/systemd/resolved.conf 中的DNS设置..."
-    # 修改 /etc/systemd/resolved.conf 中的 DNS 配置
-    sudo sed -i "/DNS=/c\DNS=${dns_array[0]}\nFallbackDNS=1.1.1.1 8.8.8.8" /etc/systemd/resolved.conf
+    
+    # 清理重复的 DNS 配置，确保只修改一次
+    sudo sed -i "/^DNS=/c\DNS=${dns_array[0]}" /etc/systemd/resolved.conf
+    sudo sed -i "/^FallbackDNS=/c\FallbackDNS=1.1.1.1 8.8.8.8" /etc/systemd/resolved.conf
+    
     # 重启 systemd-resolved 服务
     sudo systemctl restart systemd-resolved
     echo "systemd-resolved 配置已更新并重启。"
 else
     echo "系统未启用 systemd-resolved，使用 /etc/resolv.conf 配置。正在修改 /etc/resolv.conf..."
     # 如果没有 systemd-resolved，修改 /etc/resolv.conf
-    sudo sed -i "/^nameserver/c\nameserver ${dns_array[0]}" /etc/resolv.conf
+    sudo sed -i "/^nameserver/c\nnameserver ${dns_array[0]}" /etc/resolv.conf
     sudo sh -c "echo 'nameserver 1.1.1.1' >> /etc/resolv.conf"
     sudo sh -c "echo 'nameserver 8.8.8.8' >> /etc/resolv.conf"
     echo "/etc/resolv.conf 配置已更新。"
