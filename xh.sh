@@ -63,6 +63,7 @@ auto_pick_ip_version
 
 # 下载/上传地址池
 URLS=(
+  "https://speed.cloudflare.com/__down?bytes=1073741824"
   "https://nbg1-speed.hetzner.com/100MB.bin"
   "https://nbg1-speed.hetzner.com/1GB.bin"
   "https://fsn1-speed.hetzner.com/100MB.bin"
