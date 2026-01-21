@@ -49,15 +49,44 @@ ensure_root() {
 
 detect_os() {
     if [[ -n "$OS" ]]; then return; fi
+
+    # 优先使用 /etc/os-release
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release || true
+        # ID 可能为：ubuntu/debian/centos/rhel/rocky/almalinux/fedora 等
+        case "${ID:-}" in
+            ubuntu) OS="ubuntu" ;;
+            debian) OS="debian" ;;
+            centos) OS="centos" ;;
+            rhel)   OS="rhel" ;;
+            rocky)  OS="rocky" ;;
+            almalinux) OS="almalinux" ;;
+            fedora) OS="fedora" ;;
+            *) ;;
+        esac
+
+        # 若 ID 未命中，尝试用 ID_LIKE 推断
+        if [[ -z "$OS" ]]; then
+            if grep -qiE "debian|ubuntu" <<<"${ID_LIKE:-}"; then
+                OS="debianlike"
+            elif grep -qiE "rhel|fedora|centos" <<<"${ID_LIKE:-}"; then
+                OS="rhellike"
+            fi
+        fi
+
+        [[ -n "$OS" ]] && return
+    fi
+
+    # 兜底
     if [[ -f /etc/redhat-release ]]; then
-        OS="centos"
-    elif grep -qi "ubuntu" /etc/os-release; then
+        OS="rhellike"
+    elif grep -qi "ubuntu" /etc/os-release 2>/dev/null; then
         OS="ubuntu"
-    elif grep -qi "debian" /etc/os-release; then
+    elif grep -qi "debian" /etc/os-release 2>/dev/null; then
         OS="debian"
     else
-        echo "❌ 不支持的操作系统"
-        exit 1
+        OS="unknown"
     fi
 }
 
@@ -72,18 +101,161 @@ detect_firewall() {
     fi
 }
 
+#-----------------------------
+# 包管理器：探测 / 修复 / 安装（更稳健，覆盖主流发行版）
+#-----------------------------
+detect_pkg_mgr() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "yum"
+    else
+        echo "unknown"
+    fi
+}
+
+wait_for_apt_locks() {
+    # 等待 apt/dpkg 锁释放，避免“Could not get lock”
+    # 默认最多等 180 秒
+    local max_wait="${1:-180}"
+    local waited=0
+
+    while fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
+       || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+       || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+       || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+        if (( waited >= max_wait )); then
+            echo "⚠ apt/dpkg 锁仍被占用（等待 ${max_wait}s 超时）。将继续尝试后续流程。"
+            return 1
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+    return 0
+}
+
+fix_pkg_mgr_apt() {
+    echo "📦 [APT] 尝试修复 dpkg/apt 状态（尽力而为，不阻断主流程）..."
+
+    wait_for_apt_locks 180 || true
+
+    # 处理 dpkg 中断
+    dpkg --configure -a || true
+
+    # 修复依赖
+    apt-get -y -f install || true
+
+    # 清理缓存（减少索引/下载损坏影响）
+    apt-get -y clean || true
+
+    # 更新索引：重试两次
+    for i in 1 2; do
+        if apt-get update -y; then
+            echo "✅ [APT] apt-get update 成功"
+            break
+        fi
+        echo "⚠ [APT] apt-get update 失败，重试 ${i}/2 ..."
+        sleep 2
+    done
+
+    # 再尝试一次依赖修复
+    apt-get -y -f install || true
+
+    echo "✅ [APT] 修复流程已执行完成（如仍有问题，后续安装仍会继续尝试）"
+    return 0
+}
+
+fix_pkg_mgr_yum_dnf() {
+    local pm="$1"   # yum / dnf
+    echo "📦 [${pm}] 尝试修复 yum/dnf 状态（尽力而为，不阻断主流程）..."
+
+    if [[ "$pm" == "dnf" ]]; then
+        dnf -y clean all || true
+        dnf -y makecache || true
+    else
+        yum -y clean all || true
+        yum -y makecache || true
+    fi
+
+    # 处理残留事务（yum 上更常见）
+    if command -v yum-complete-transaction >/dev/null 2>&1; then
+        yum-complete-transaction -y || true
+    elif [[ "$pm" == "dnf" ]]; then
+        # dnf 环境下尽力做一次 distro-sync（不强制）
+        dnf -y distro-sync || true
+    fi
+
+    # rpmdb 轻度修复
+    if command -v rpm >/dev/null 2>&1; then
+        rpm --rebuilddb >/dev/null 2>&1 || true
+    fi
+
+    echo "✅ [${pm}] 修复流程已执行完成（如仍有问题，后续安装仍会继续尝试）"
+    return 0
+}
+
+fix_pkg_mgr() {
+    local pm
+    pm="$(detect_pkg_mgr)"
+    case "$pm" in
+        apt) fix_pkg_mgr_apt ;;
+        dnf) fix_pkg_mgr_yum_dnf "dnf" ;;
+        yum) fix_pkg_mgr_yum_dnf "yum" ;;
+        *)
+            echo "⚠ 未识别到可用包管理器（apt/dnf/yum），跳过自动修复。"
+            return 1
+            ;;
+    esac
+}
+
+install_pkgs() {
+    # 用当前系统可用的包管理器安装若干包：install_pkgs pkg1 pkg2 ...
+    # 目标：尽量提高成功率（失败时尽力修复并重试 1 次）
+    local pm
+    pm="$(detect_pkg_mgr)"
+
+    case "$pm" in
+        apt)
+            wait_for_apt_locks 180 || true
+            apt-get update -y || true
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"; then
+                echo "⚠ [APT] 安装失败，尝试修复后重试一次..."
+                fix_pkg_mgr_apt || true
+                wait_for_apt_locks 180 || true
+                apt-get update -y || true
+                DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+            fi
+            ;;
+        dnf)
+            if ! dnf -y install "$@"; then
+                echo "⚠ [DNF] 安装失败，尝试修复后重试一次..."
+                fix_pkg_mgr_yum_dnf "dnf" || true
+                dnf -y install "$@"
+            fi
+            ;;
+        yum)
+            if ! yum -y install "$@"; then
+                echo "⚠ [YUM] 安装失败，尝试修复后重试一次..."
+                fix_pkg_mgr_yum_dnf "yum" || true
+                yum -y install "$@"
+            fi
+            ;;
+        *)
+            echo "❌ 无法安装：未找到 apt/dnf/yum"
+            return 1
+            ;;
+    esac
+}
+
 ensure_curl() {
     if command -v curl &>/dev/null; then
         return
     fi
-    detect_os
     echo "📦 未检测到 curl，正在安装..."
-    if [[ $OS == "centos" ]]; then
-        yum install -y curl
-    else
-        apt-get update
-        apt-get install -y curl
-    fi
+    fix_pkg_mgr || true
+    install_pkgs curl
 }
 
 get_action_for_firewall() {
@@ -126,7 +298,13 @@ get_sshd_value() {
         BEGIN{in_sshd=0}
         /^\[sshd\]/{in_sshd=1; next}
         /^\[.*\]/{if(in_sshd){in_sshd=0}}
-        in_sshd && $1==k {print $3}
+        in_sshd {
+            if ($0 ~ "^[[:space:]]*" k "[[:space:]]*=") {
+                sub("^[[:space:]]*" k "[[:space:]]*=[[:space:]]*", "", $0)
+                sub("[[:space:]]*$", "", $0)
+                print $0
+            }
+        }
     ' "$JAIL" 2>/dev/null | tail -n1
 }
 
@@ -214,7 +392,7 @@ add_ip_to_ignoreip() {
 
     mkdir -p /etc/fail2ban
 
-    # 如果 jail.local 不存在，先创建一个最小 [DEFAULT]，后续菜单1还会补齐默认参数
+    # 如果 jail.local 不存在，先创建一个最小 [DEFAULT]
     if [[ ! -f "$JAIL" ]]; then
         cat > "$JAIL" <<EOF
 [DEFAULT]
@@ -457,49 +635,16 @@ install_or_config_ssh() {
 
     echo "🧩 系统类型: $OS"
     echo "🛡 防火墙: $FIREWALL"
+    echo "📦 包管理器: $(detect_pkg_mgr)"
     echo ""
 
-    # 自动修复系统包管理器错误
-    echo "📦 检查并修复包管理器错误..."
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        # 针对 Debian/Ubuntu 系统
-        echo "✅ 系统为 Debian/Ubuntu，使用 dpkg 修复..."
-        if dpkg --configure -a; then
-            echo "✅ dpkg 修复成功！"
-        else
-            echo "⚠ dpkg 修复失败，可能需要手动检查并修复。"
-            pause
-            return
-        fi
-    elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "fedora" ]]; then
-        # 针对 CentOS/RHEL/Fedora 系统
-        echo "✅ 系统为 CentOS/RHEL/Fedora，使用 yum 修复..."
-        if yum-complete-transaction; then
-            echo "✅ yum 修复成功！"
-        else
-            echo "⚠ yum 修复失败，可能需要手动检查并修复。"
-            pause
-            return
-        fi
-    else
-        echo "⚠ 不支持的操作系统，无法自动修复包管理器错误。"
-        pause
-        return
-    fi
+    # ✅ 新版：尽力修复包管理器（不阻断主流程）
+    echo "📦 检查并尽力修复包管理器状态（不中断主流程）..."
+    fix_pkg_mgr || true
 
-    # 提示用户输入 SSH 端口，默认是 22
+    # 提示用户输入 SSH 端口（复用函数）
     local SSH_PORT=""
-    while true; do
-        read -rp "请输入 SSH 端口号（回车默认 22）: " SSH_PORT
-        if [[ -z "$SSH_PORT" ]]; then
-            SSH_PORT="22"  # 默认使用 22
-            break
-        elif [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )); then
-            break
-        else
-            echo "⚠ 端口号无效，请输入 1-65535 之间的整数，或直接回车默认 22。"
-        fi
-    done
+    SSH_PORT="$(prompt_ssh_port)"
 
     # 检查 Fail2ban 是否已经安装
     echo "📦 检查 Fail2ban 是否已安装..."
@@ -507,11 +652,25 @@ install_or_config_ssh() {
         echo "✅ Fail2ban 已安装，跳过安装步骤。"
     else
         echo "📦 安装 Fail2ban..."
-        if [[ $OS == "centos" ]]; then
-            yum install -y epel-release >/dev/null 2>&1 || true
-            yum install -y fail2ban fail2ban-firewalld >/dev/null 2>&1 || yum install -y fail2ban -y
+        local PM
+        PM="$(detect_pkg_mgr)"
+
+        if [[ "$PM" == "apt" ]]; then
+            install_pkgs fail2ban
+        elif [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+            # 尽力启用 EPEL（Fedora/部分环境可能不需要；失败不阻断）
+            if install_pkgs epel-release >/dev/null 2>&1; then
+                echo "✅ 已尝试安装/启用 epel-release"
+            else
+                echo "ℹ️ epel-release 不可用或安装失败（将继续尝试安装 fail2ban）"
+            fi
+
+            # 某些环境有 fail2ban-firewalld；没有也无妨
+            install_pkgs fail2ban fail2ban-firewalld || install_pkgs fail2ban
         else
-            apt-get update && apt-get install -y fail2ban
+            echo "❌ 未识别包管理器，无法自动安装 Fail2ban。"
+            pause
+            return
         fi
     fi
 
@@ -704,10 +863,15 @@ uninstall_all() {
     case "$CONFIRM2" in
         y|Y)
             detect_os
-            if [[ $OS == "centos" ]]; then
-                yum remove -y fail2ban || true
-            else
+            PM="$(detect_pkg_mgr)"
+            if [[ "$PM" == "apt" ]]; then
                 apt-get purge -y fail2ban || true
+            elif [[ "$PM" == "dnf" ]]; then
+                dnf -y remove fail2ban || true
+            elif [[ "$PM" == "yum" ]]; then
+                yum -y remove fail2ban || true
+            else
+                echo "⚠ 未识别包管理器，跳过卸载软件包。"
             fi
             systemctl disable fail2ban 2>/dev/null || true
             echo "✅ fail2ban 软件包已卸载。"
