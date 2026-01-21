@@ -3,11 +3,27 @@
 # Fail2ban SSH Protector 菜单版 (2025)
 # Author: DadaGi（大大怪）
 #
+# 功能：
+#   1) 安装 / 配置 Fail2ban 仅用于 SSH 防爆破
+#      - 安装时输入 SSH 端口，回车默认 22
+#      - 自动把当前 SSH 来源 IP 加入 Fail2ban ignoreip（避免误封自己）
+#      - 自动安装 fb5 命令：/usr/local/bin/fb5（可直接 fb5 打开面板）
+#      - 同时把当前 SSH 来源 IP 加入 SSH 连接白名单列表（菜单7）
+#   2) 快捷修改 SSH 防爆破参数（maxretry / bantime / findtime）
+#   3) 卸载本脚本相关配置（可选同时卸载 fail2ban + 清理白名单/兜底服务）
+#   4) 从远程更新 fb5 脚本（仅更新：下载覆盖并赋权）
+#   5) 查看当前封禁 IP 列表（sshd jail）
+#   6) 解禁指定 IP（sshd jail）
+#   7) SSH 连接白名单（防火墙层：只允许白名单 IP 连接 SSH，新增/删除立即应用，重启自动加载）
+#
+# 默认策略（首次安装 / 无 [sshd] 参数时）：
+#   - maxretry = 3
+#   - findtime = 21600（6小时）
+#   - bantime  = 12h
+#
 # 关键修复：
-#   - systemd 兜底(B)始终可用：开机自动执行 fb5 --apply-allowlist
-#   - 防止 systemd 进入菜单：非交互入口 --apply-allowlist
-#   - 如果 /usr/local/bin/fb5 不是新版本（无 --apply-allowlist），自动覆盖安装
-#   - clear 仅在 TTY 环境执行，避免 TERM 报错
+#   - systemd 兜底服务 fb5-ssh-allowlist：开机执行 fb5 --apply-allowlist，避免进入菜单导致 TERM 报错
+#   - clear 仅在 TTY 环境执行，避免 TERM environment variable not set
 # ============================================================
 
 set -e
@@ -21,11 +37,13 @@ JAIL="/etc/fail2ban/jail.local"
 INSTALL_CMD_PATH="/usr/local/bin/fb5"
 REMOTE_URL="https://raw.githubusercontent.com/shini74744/jj/refs/heads/main/fb5.sh"
 
-# SSH 白名单
+# SSH 白名单（防火墙层）
 ALLOWLIST_DIR="/etc/fb5"
 ALLOWLIST_FILE="${ALLOWLIST_DIR}/ssh_allowlist.txt"
 ALLOWLIST_ENABLED_FLAG="${ALLOWLIST_DIR}/ssh_allowlist_enabled"
 SSH_PORT_OVERRIDE_FILE="${ALLOWLIST_DIR}/ssh_port_override"
+
+# iptables
 IPTABLES_CHAIN="FB5_SSH_ALLOW"
 
 # nftables
@@ -42,7 +60,7 @@ FIREWALLD_IPSET="fb5-ssh-allow"
 SYSTEMD_UNIT="/etc/systemd/system/fb5-ssh-allowlist.service"
 
 #-----------------------------
-# 小工具：仅在TTY clear，避免 TERM 报错
+# UI / 通用
 #-----------------------------
 safe_clear() {
     if [[ -t 1 ]] && command -v clear >/dev/null 2>&1; then
@@ -102,7 +120,7 @@ have_systemd() {
 }
 
 #-----------------------------
-# 包管理器：稳健安装
+# 包管理器：稳健修复/安装
 #-----------------------------
 detect_pkg_mgr() {
     if command -v apt-get >/dev/null 2>&1; then echo "apt"
@@ -152,7 +170,10 @@ fix_pkg_mgr() {
             fi
             rpm --rebuilddb >/dev/null 2>&1 || true
             ;;
-        *) return 1 ;;
+        *)
+            echo "⚠ 未识别包管理器，跳过自动修复。"
+            return 1
+            ;;
     esac
     return 0
 }
@@ -176,7 +197,10 @@ install_pkgs() {
         yum)
             yum -y install "$@" || { fix_pkg_mgr || true; yum -y install "$@"; }
             ;;
-        *) echo "❌ 未识别包管理器，无法安装：$*"; return 1 ;;
+        *)
+            echo "❌ 未识别包管理器，无法安装：$*"
+            return 1
+            ;;
     esac
 }
 
@@ -187,7 +211,7 @@ ensure_curl() {
 }
 
 #-----------------------------
-# SSH / Fail2ban helpers
+# Fail2ban / SSH helpers
 #-----------------------------
 get_action_for_firewall() {
     detect_firewall
@@ -202,7 +226,10 @@ pick_ssh_logpath() {
     local paths=()
     [[ -f /var/log/auth.log ]] && paths+=("/var/log/auth.log")
     [[ -f /var/log/secure ]] && paths+=("/var/log/secure")
-    (( ${#paths[@]} == 0 )) && { echo "/var/log/auth.log /var/log/secure"; return; }
+    if (( ${#paths[@]} == 0 )); then
+        echo "/var/log/auth.log /var/log/secure"
+        return
+    fi
     echo "${paths[*]}"
 }
 
@@ -210,8 +237,12 @@ prompt_ssh_port() {
     local p=""
     while true; do
         read -rp "请输入 SSH 端口号（回车默认 22）: " p
-        [[ -z "$p" ]] && { echo "22"; return; }
-        if [[ "$p" =~ ^[0-9]+$ ]] && (( p>=1 && p<=65535 )); then echo "$p"; return; fi
+        if [[ -z "$p" ]]; then
+            echo "22"; return
+        fi
+        if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); then
+            echo "$p"; return
+        fi
         echo "⚠ 端口号无效，请输入 1-65535 的整数，或直接回车默认 22。"
     done
 }
@@ -233,7 +264,13 @@ get_sshd_value() {
 }
 
 rewrite_or_append_sshd_block() {
-    local port="$1" action="$2" logpath="$3" maxretry="$4" findtime="$5" bantime="$6"
+    local port="$1"
+    local action="$2"
+    local logpath="$3"
+    local maxretry="$4"
+    local findtime="$5"
+    local bantime="$6"
+
     mkdir -p /etc/fail2ban
     [[ -f "$JAIL" ]] || touch "$JAIL"
 
@@ -253,7 +290,8 @@ EOF
         return
     fi
 
-    local tmpfile; tmpfile="$(mktemp)"
+    local tmpfile
+    tmpfile="$(mktemp)"
     awk -v port="$port" -v action="$action" -v logpath="$logpath" \
         -v maxretry="$maxretry" -v findtime="$findtime" -v bantime="$bantime" '
         BEGIN{in_sshd=0; printed=0}
@@ -279,23 +317,34 @@ EOF
 }
 
 get_current_ssh_client_ip() {
-    [[ -n "${SSH_CONNECTION-}" ]] && { awk '{print $1}' <<<"$SSH_CONNECTION"; return 0; }
-    [[ -n "${SSH_CLIENT-}" ]] && { awk '{print $1}' <<<"$SSH_CLIENT"; return 0; }
+    if [[ -n "${SSH_CONNECTION-}" ]]; then
+        awk '{print $1}' <<<"$SSH_CONNECTION"
+        return 0
+    fi
+    if [[ -n "${SSH_CLIENT-}" ]]; then
+        awk '{print $1}' <<<"$SSH_CLIENT"
+        return 0
+    fi
     return 1
 }
 
 get_current_session_ssh_port() {
-    [[ -n "${SSH_CONNECTION-}" ]] && { awk '{print $4}' <<<"$SSH_CONNECTION" | grep -E '^[0-9]+$' || true; return 0; }
+    if [[ -n "${SSH_CONNECTION-}" ]]; then
+        awk '{print $4}' <<<"$SSH_CONNECTION" | grep -E '^[0-9]+$' || true
+        return 0
+    fi
     return 1
 }
 
 add_ip_to_ignoreip() {
     local ip="$1"
     [[ -z "$ip" ]] && return 1
-    [[ "$ip" =~ [[:space:]] ]] && return 1
-    [[ "$ip" =~ ^[0-9a-fA-F:./]+$ ]] || return 1
+    if [[ "$ip" =~ [[:space:]] ]] || ! [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
+        return 1
+    fi
 
     mkdir -p /etc/fail2ban
+
     if [[ ! -f "$JAIL" ]]; then
         cat > "$JAIL" <<EOF
 [DEFAULT]
@@ -305,36 +354,56 @@ EOF
     fi
 
     if ! grep -q "^\[DEFAULT\]" "$JAIL"; then
-        local tmpf; tmpf="$(mktemp)"
-        { echo "[DEFAULT]"; echo "ignoreip = 127.0.0.1/8 $ip"; echo ""; cat "$JAIL"; } > "$tmpf" && mv "$tmpf" "$JAIL"
+        local tmpf
+        tmpf="$(mktemp)"
+        {
+            echo "[DEFAULT]"
+            echo "ignoreip = 127.0.0.1/8 $ip"
+            echo ""
+            cat "$JAIL"
+        } > "$tmpf" && mv "$tmpf" "$JAIL"
         return 0
     fi
 
-    local tmpfile; tmpfile="$(mktemp)"
+    local tmpfile
+    tmpfile="$(mktemp)"
     awk -v ip="$ip" '
-        function has_ip(line, x){ return (index(" " line " ", " " x " ") > 0) }
+        function has_ip(line, x){
+            return (index(" " line " ", " " x " ") > 0)
+        }
         BEGIN{in_def=0; has_ignore=0}
         /^\[DEFAULT\]$/ {in_def=1; print; next}
         /^\[/ && $0 !~ /^\[DEFAULT\]$/ {
-            if(in_def && has_ignore==0){ print "ignoreip = 127.0.0.1/8 " ip }
-            in_def=0; print; next
+            if(in_def && has_ignore==0){
+                print "ignoreip = 127.0.0.1/8 " ip
+            }
+            in_def=0
+            print
+            next
         }
         {
             if(in_def && $0 ~ /^ignoreip[[:space:]]*=/){
                 has_ignore=1
-                if(has_ip($0, ip)) print
-                else print $0 " " ip
+                if(has_ip($0, ip)){
+                    print
+                } else {
+                    print $0 " " ip
+                }
                 next
             }
             print
         }
-        END{ if(in_def && has_ignore==0) print "ignoreip = 127.0.0.1/8 " ip }
+        END{
+            if(in_def && has_ignore==0){
+                print "ignoreip = 127.0.0.1/8 " ip
+            }
+        }
     ' "$JAIL" > "$tmpfile" && mv "$tmpfile" "$JAIL"
     return 0
 }
 
 #-----------------------------
-# fb5 安装：保证 /usr/local/bin/fb5 一定是新版本
+# fb5 安装/更新：确保 /usr/local/bin/fb5 可用且支持 --apply-allowlist
 #-----------------------------
 fb5_supports_apply() {
     [[ -x "$INSTALL_CMD_PATH" ]] && grep -q -- "--apply-allowlist" "$INSTALL_CMD_PATH" 2>/dev/null
@@ -343,7 +412,6 @@ fb5_supports_apply() {
 install_fb5_now() {
     mkdir -p "$(dirname "$INSTALL_CMD_PATH")"
 
-    # 优先复制“当前运行的脚本文件”
     local src="$0"
     if command -v readlink &>/dev/null; then
         src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -355,7 +423,6 @@ install_fb5_now() {
         return 0
     fi
 
-    # 兜底：远程下载
     ensure_curl
     curl -fsSL "$REMOTE_URL" -o "$INSTALL_CMD_PATH"
     chmod +x "$INSTALL_CMD_PATH"
@@ -363,7 +430,6 @@ install_fb5_now() {
 }
 
 ensure_fb5_is_new() {
-    # 若不存在或不支持 --apply-allowlist，强制覆盖安装
     if ! fb5_supports_apply; then
         install_fb5_now || true
     fi
@@ -371,53 +437,96 @@ ensure_fb5_is_new() {
 }
 
 #-----------------------------
-# Fail2ban 状态（5/6）
+# Fail2ban 状态检查（用于 5/6）
 #-----------------------------
 ensure_fail2ban_ready() {
-    command -v fail2ban-client &>/dev/null || { echo "❌ 未检测到 fail2ban-client"; return 1; }
-    if have_systemd && ! systemctl is-active --quiet fail2ban; then
-        echo "❌ Fail2ban 未运行（可尝试 systemctl restart fail2ban）"
+    if ! command -v fail2ban-client &>/dev/null; then
+        echo "❌ 未检测到 fail2ban-client（Fail2ban 可能未安装）。"
         return 1
     fi
-    fail2ban-client status sshd &>/dev/null || { echo "❌ sshd jail 未启用，请先菜单1"; return 1; }
+    if have_systemd; then
+        if ! systemctl is-active --quiet fail2ban; then
+            echo "❌ Fail2ban 当前未运行（fail2ban 服务未 active）。"
+            echo "   可尝试：systemctl restart fail2ban"
+            return 1
+        fi
+    fi
+    if ! fail2ban-client status sshd &>/dev/null; then
+        echo "❌ sshd jail 未启用或无法查询。"
+        echo "   请先执行菜单 1 安装/配置 SSH 防爆破。"
+        return 1
+    fi
     return 0
 }
 
+#-----------------------------
+# 5. 查看封禁 IP（sshd）
+#-----------------------------
 view_banned_ips() {
-    ensure_fail2ban_ready || { pause; return; }
+    if ! ensure_fail2ban_ready; then
+        pause
+        return
+    fi
     echo "================ sshd 当前封禁 IP ================"
     if fail2ban-client get sshd banip &>/dev/null; then
-        local ips; ips="$(fail2ban-client get sshd banip | tr -s ' ' | sed 's/^ *//;s/ *$//')"
-        [[ -z "$ips" ]] && echo "✅ 当前无封禁 IP" || echo "$ips" | tr ' ' '\n'
+        local ips
+        ips="$(fail2ban-client get sshd banip | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+        if [[ -z "$ips" ]]; then
+            echo "✅ 当前无封禁 IP"
+        else
+            echo "$ips" | tr ' ' '\n'
+        fi
     else
+        echo "（当前 fail2ban-client 不支持 get banip，改用 status 输出）"
         fail2ban-client status sshd || true
     fi
     echo "=================================================="
+    echo ""
     pause
 }
 
+#-----------------------------
+# 6. 解禁指定 IP（sshd）
+#-----------------------------
 unban_ip() {
-    ensure_fail2ban_ready || { pause; return; }
+    if ! ensure_fail2ban_ready; then
+        pause
+        return
+    fi
+
     local ip=""
-    read -rp "请输入要解禁的 IP（回车取消）: " ip
-    [[ -z "$ip" ]] && { echo "已取消。"; pause; return; }
-    [[ "$ip" =~ ^[0-9a-fA-F:./]+$ ]] || { echo "⚠ IP 格式不正确"; pause; return; }
+    read -rp "请输入要解禁的 IP（IPv4/IPv6，回车取消）: " ip
+    if [[ -z "$ip" ]]; then
+        echo "已取消。"
+        pause
+        return
+    fi
+
+    if [[ "$ip" =~ [[:space:]] ]] || ! [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
+        echo "⚠ IP 格式看起来不正确：$ip"
+        pause
+        return
+    fi
+
     if fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1; then
         echo "✅ 已解禁：$ip"
     else
         echo "❌ 解禁失败：$ip"
+        echo "   可能原因：该 IP 不在封禁列表中，或 fail2ban 运行异常。"
     fi
+
+    echo ""
     pause
 }
 
 # ============================================================
-# 7. SSH 连接白名单（只允许白名单 IP 连接 SSH）
+# 7) SSH 连接白名单（防火墙层）
 # ============================================================
 
 ensure_allowlist_storage() {
     mkdir -p "$ALLOWLIST_DIR"
     touch "$ALLOWLIST_FILE"
-    chmod 600 "$ALLOWLIST_FILE" || true
+    chmod 600 "$ALLOWLIST_FILE" 2>/dev/null || true
 }
 
 is_valid_ip_or_cidr() {
@@ -446,18 +555,24 @@ allowlist_del_ip() {
     return 0
 }
 
+allowlist_show() {
+    ensure_allowlist_storage
+    echo "================ SSH 白名单列表 ================"
+    if [[ ! -s "$ALLOWLIST_FILE" ]]; then
+        echo "（当前为空）"
+    else
+        nl -ba "$ALLOWLIST_FILE"
+    fi
+    echo "==============================================="
+}
+
 sync_current_ssh_ip_to_allowlist() {
     ensure_allowlist_storage
     local cur=""
     cur="$(get_current_ssh_client_ip 2>/dev/null || true)"
-    [[ -n "$cur" ]] && allowlist_add_ip "$cur" >/dev/null 2>&1 || true
-}
-
-allowlist_show() {
-    ensure_allowlist_storage
-    echo "================ SSH 白名单列表 ================"
-    [[ ! -s "$ALLOWLIST_FILE" ]] && echo "（当前为空）" || nl -ba "$ALLOWLIST_FILE"
-    echo "==============================================="
+    if [[ -n "$cur" ]]; then
+        allowlist_add_ip "$cur" >/dev/null 2>&1 || true
+    fi
 }
 
 read_ssh_port_override() {
@@ -467,8 +582,15 @@ read_ssh_port_override() {
     return 1
 }
 
-write_ssh_port_override() { ensure_allowlist_storage; echo "$1" >"$SSH_PORT_OVERRIDE_FILE"; chmod 600 "$SSH_PORT_OVERRIDE_FILE" || true; }
-clear_ssh_port_override() { rm -f "$SSH_PORT_OVERRIDE_FILE" >/dev/null 2>&1 || true; }
+write_ssh_port_override() {
+    ensure_allowlist_storage
+    echo "$1" > "$SSH_PORT_OVERRIDE_FILE"
+    chmod 600 "$SSH_PORT_OVERRIDE_FILE" 2>/dev/null || true
+}
+
+clear_ssh_port_override() {
+    rm -f "$SSH_PORT_OVERRIDE_FILE" >/dev/null 2>&1 || true
+}
 
 get_effective_ssh_port() {
     local ov=""; ov="$(read_ssh_port_override 2>/dev/null || true)"
@@ -498,7 +620,7 @@ get_effective_ssh_port() {
 }
 
 #-----------------------------
-# 运行时规则下发：firewalld / nftables / iptables
+# 防火墙规则下发：iptables / nftables / firewalld
 #-----------------------------
 apply_allowlist_rules_iptables() {
     local port="$1"
@@ -575,7 +697,6 @@ apply_allowlist_rules_nftables() {
 
     [[ -n "$v4_set" ]] && nft add rule "$NFT_FAMILY" "$NFT_TABLE" input ip saddr "{ $v4_set }" tcp dport "$port" accept
     [[ -n "$v6_set" ]] && nft add rule "$NFT_FAMILY" "$NFT_TABLE" input ip6 saddr "{ $v6_set }" tcp dport "$port" accept
-
     nft add rule "$NFT_FAMILY" "$NFT_TABLE" input tcp dport "$port" drop
     return 0
 }
@@ -589,7 +710,6 @@ apply_allowlist_rules_firewalld() {
     local port="$1"
     ensure_allowlist_storage
     command -v firewall-cmd >/dev/null 2>&1 || return 1
-
     firewall-cmd --state >/dev/null 2>&1 || return 1
 
     firewall-cmd --permanent --delete-ipset="$FIREWALLD_IPSET" >/dev/null 2>&1 || true
@@ -606,7 +726,6 @@ apply_allowlist_rules_firewalld() {
     firewall-cmd --permanent --remove-rich-rule="$rule_drop"  >/dev/null 2>&1 || true
     firewall-cmd --permanent --add-rich-rule="$rule_allow"
     firewall-cmd --permanent --add-rich-rule="$rule_drop"
-
     firewall-cmd --reload >/dev/null 2>&1 || firewall-cmd --complete-reload >/dev/null 2>&1 || true
     return 0
 }
@@ -647,56 +766,7 @@ enable_allowlist_flag() { ensure_allowlist_storage; : > "$ALLOWLIST_ENABLED_FLAG
 disable_allowlist_flag() { rm -f "$ALLOWLIST_ENABLED_FLAG" >/dev/null 2>&1 || true; }
 
 #-----------------------------
-# 兜底(B)：systemd 开机重放（强制可用）
-#-----------------------------
-ensure_systemd_fallback_unit() {
-    have_systemd || return 1
-
-    # 强制确保 /usr/local/bin/fb5 是新版本（支持 --apply-allowlist）
-    if ! ensure_fb5_is_new; then
-        echo "❌ fb5 命令不是新版本或不可用，无法创建 systemd 兜底。"
-        return 1
-    fi
-
-    cat > "$SYSTEMD_UNIT" <<'EOF'
-[Unit]
-Description=FB5 SSH Allowlist Enforcer (Boot Re-Apply)
-After=network-online.target
-Wants=network-online.target
-After=firewalld.service nftables.service
-Wants=firewalld.service nftables.service
-
-[Service]
-Type=oneshot
-Environment=TERM=dumb
-ExecStart=/usr/local/bin/fb5 --apply-allowlist
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    return 0
-}
-
-enable_systemd_fallback() {
-    have_systemd || return 1
-    ensure_systemd_fallback_unit || return 1
-    systemctl enable --now fb5-ssh-allowlist >/dev/null 2>&1
-    return 0
-}
-
-disable_systemd_fallback() {
-    have_systemd || return 0
-    systemctl disable --now fb5-ssh-allowlist >/dev/null 2>&1 || true
-    rm -f "$SYSTEMD_UNIT" >/dev/null 2>&1 || true
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    return 0
-}
-
-#-----------------------------
-# 方案A：nftables 永久文件（尽力而为，不依赖它也能靠B）
+# 持久化(A)：nftables include 文件（尽力）
 #-----------------------------
 build_nft_persist_file() {
     local port="$1"
@@ -755,7 +825,7 @@ persist_allowlist_A() {
     case "$FIREWALL" in
         firewalld) return 0 ;; # firewalld permanent 本身可持久化
         nftables)  persist_allowlist_A_nftables "$port" ;;
-        *) return 0 ;;         # iptables 持久化依赖较多，这里不强制
+        *)         return 0 ;; # iptables 持久化依赖系统组件，交给B兜底
     esac
 }
 
@@ -769,11 +839,58 @@ remove_persist_A() {
             ;;
         *) return 0 ;;
     esac
+}
+
+#-----------------------------
+# 兜底(B)：systemd 开机重放（强制）
+#-----------------------------
+ensure_systemd_fallback_unit() {
+    have_systemd || return 1
+
+    # 必须确保 fb5 是新版本（支持 --apply-allowlist）
+    if ! ensure_fb5_is_new; then
+        return 1
+    fi
+
+    cat > "$SYSTEMD_UNIT" <<'EOF'
+[Unit]
+Description=FB5 SSH Allowlist Enforcer (Boot Re-Apply)
+After=network-online.target
+Wants=network-online.target
+After=firewalld.service nftables.service
+Wants=firewalld.service nftables.service
+
+[Service]
+Type=oneshot
+Environment=TERM=dumb
+ExecStart=/usr/local/bin/fb5 --apply-allowlist
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    return 0
+}
+
+enable_systemd_fallback() {
+    have_systemd || return 1
+    ensure_systemd_fallback_unit || return 1
+    systemctl enable --now fb5-ssh-allowlist >/dev/null 2>&1
+    return 0
+}
+
+disable_systemd_fallback() {
+    have_systemd || return 0
+    systemctl disable --now fb5-ssh-allowlist >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_UNIT" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
     return 0
 }
 
 #-----------------------------
-# 立即应用：运行时 + A尽力 + B强制启用（保证重启恢复）
+# 立即应用：运行时 + A尽力 + B强制
 #-----------------------------
 apply_allowlist_immediately_or_disable_if_empty() {
     local port="$1"
@@ -798,13 +915,13 @@ apply_allowlist_immediately_or_disable_if_empty() {
         echo "⚠ 持久化(A)未确认成功（不影响最终效果，将由兜底(B)保证重启恢复）。"
     fi
 
-    # 关键：只要启用白名单，就必须启用(B)
     if have_systemd; then
-        enable_systemd_fallback || {
-            echo "❌ 兜底(B)启用失败：请检查 /usr/local/bin/fb5 是否为新版本且可执行。"
+        if enable_systemd_fallback; then
+            echo "✅ 兜底(B)已启用：重启后会自动重新下发白名单规则。"
+        else
+            echo "❌ 兜底(B)启用失败（请检查 /usr/local/bin/fb5 是否为新版本且可执行）。"
             return 1
-        }
-        echo "✅ 兜底(B)已启用：重启后会自动重新下发白名单规则。"
+        fi
     else
         echo "⚠ 系统无 systemd，无法启用兜底(B)。重启持久化仅依赖(A)。"
     fi
@@ -812,9 +929,6 @@ apply_allowlist_immediately_or_disable_if_empty() {
     return 0
 }
 
-#-----------------------------
-# 白名单菜单
-#-----------------------------
 ssh_allowlist_menu() {
     detect_firewall
     ensure_allowlist_storage
@@ -824,19 +938,22 @@ ssh_allowlist_menu() {
 
     while true; do
         safe_clear
+        port="$(get_effective_ssh_port)"
         echo "==============================================="
         echo " SSH 连接白名单（只允许白名单 IP 连接 SSH）"
         echo " 防火墙类型: $FIREWALL"
         echo " SSH 端口(当前生效): $port"
         echo " 白名单文件: $ALLOWLIST_FILE"
         echo "==============================================="
-        echo " 1) 查看当前白名单（自动同步当前 SSH 来源 IP）"
-        echo " 2) 追加添加 IP（立刻生效）"
-        echo " 3) 删除白名单 IP（立刻生效；若删空自动关闭限制）"
+        echo " 1) 查看当前白名单（并同步当前 SSH 来源 IP）"
+        echo " 2) 追加添加 IP（立即应用）"
+        echo " 3) 删除白名单 IP（立即应用；若删空自动关闭限制）"
         echo " 4) 关闭白名单限制（移除规则；保留列表文件）"
+        echo " 5) 设置白名单端口覆盖（手动指定 SSH 端口）"
+        echo " 6) 清除端口覆盖（恢复自动检测）"
         echo " 0) 返回主菜单"
         echo "-----------------------------------------------"
-        read -rp "请输入选项 [0-4]: " C
+        read -rp "请输入选项 [0-6]: " C
 
         case "$C" in
             1)
@@ -862,11 +979,7 @@ ssh_allowlist_menu() {
                 [[ "$ok" =~ ^[yY]$ ]] || { echo "已取消应用（白名单列表已更新）。"; pause; continue; }
 
                 port="$(get_effective_ssh_port)"
-                if apply_allowlist_immediately_or_disable_if_empty "$port"; then
-                    echo "✅ 已应用白名单（并启用重启兜底）。"
-                else
-                    echo "❌ 应用失败。"
-                fi
+                apply_allowlist_immediately_or_disable_if_empty "$port" || true
                 pause
                 ;;
             3)
@@ -885,7 +998,6 @@ ssh_allowlist_menu() {
                 fi
 
                 allowlist_del_ip "$dip" || { echo "⚠ 白名单中不存在：$dip"; pause; continue; }
-
                 port="$(get_effective_ssh_port)"
                 apply_allowlist_immediately_or_disable_if_empty "$port" || true
                 echo "✅ 已更新并立即生效。"
@@ -904,6 +1016,32 @@ ssh_allowlist_menu() {
                 echo "✅ 已关闭白名单限制（运行时/持久化/兜底已清理）。"
                 pause
                 ;;
+            5)
+                local np=""
+                read -rp "请输入要覆盖的 SSH 端口（1-65535；回车取消）: " np
+                [[ -z "$np" ]] && { echo "已取消。"; pause; continue; }
+                if [[ "$np" =~ ^[0-9]+$ ]] && (( np>=1 && np<=65535 )); then
+                    write_ssh_port_override "$np"
+                    echo "✅ 已设置端口覆盖：$np"
+                    if [[ -f "$ALLOWLIST_ENABLED_FLAG" ]]; then
+                        echo "ℹ️ 白名单已启用，将立即按新端口重下发规则。"
+                        apply_allowlist_immediately_or_disable_if_empty "$np" || true
+                    fi
+                else
+                    echo "⚠ 端口无效。"
+                fi
+                pause
+                ;;
+            6)
+                clear_ssh_port_override
+                echo "✅ 已清除端口覆盖，恢复自动检测。"
+                if [[ -f "$ALLOWLIST_ENABLED_FLAG" ]]; then
+                    port="$(get_effective_ssh_port)"
+                    echo "ℹ️ 白名单已启用，将立即按自动检测端口($port)重下发规则。"
+                    apply_allowlist_immediately_or_disable_if_empty "$port" || true
+                fi
+                pause
+                ;;
             0) return ;;
             *) echo "❌ 无效选项。"; pause ;;
         esac
@@ -911,7 +1049,137 @@ ssh_allowlist_menu() {
 }
 
 #-----------------------------
-# 1. 安装 / 配置 SSH 防爆破
+# 4. 从远程更新 fb5（仅更新功能）
+#-----------------------------
+update_fb5_from_remote() {
+    ensure_curl
+    echo "================ 远程更新 fb5 脚本 ================"
+    echo "将从远程地址："
+    echo "  $REMOTE_URL"
+    echo "下载并覆盖到："
+    echo "  $INSTALL_CMD_PATH"
+    echo "===================================================="
+    echo ""
+    read -rp "确认进行远程更新吗？[y/N]: " CONFIRM
+    case "$CONFIRM" in
+        y|Y) ;;
+        *)   echo "已取消。"; pause; return ;;
+    esac
+
+    mkdir -p "$(dirname "$INSTALL_CMD_PATH")"
+    if ! curl -fsSL "$REMOTE_URL" -o "$INSTALL_CMD_PATH"; then
+        echo "❌ 远程更新失败，请检查网络或仓库地址是否可访问。"
+        pause
+        return
+    fi
+
+    chmod +x "$INSTALL_CMD_PATH"
+    echo "✅ 更新完成：$INSTALL_CMD_PATH"
+    echo "👉 现在可直接运行：fb5"
+    echo ""
+    pause
+}
+
+#-----------------------------
+# 2. 快捷修改 SSH 防爆破参数
+#-----------------------------
+modify_ssh_params() {
+    if [[ ! -f "$JAIL" ]]; then
+        echo "⚠ 未检测到 $JAIL，请先执行『1) 安装/配置 SSH 防爆破』"
+        pause
+        return
+    fi
+
+    if ! grep -q "^\[sshd\]" "$JAIL"; then
+        echo "⚠ jail.local 中没有 [sshd] 段，请先通过菜单 1 生成。"
+        pause
+        return
+    fi
+
+    local CURRENT_MAXRETRY CURRENT_BANTIME CURRENT_FINDTIME CURRENT_PORT
+    CURRENT_MAXRETRY="$(get_sshd_value maxretry)"; [[ -z "$CURRENT_MAXRETRY" ]] && CURRENT_MAXRETRY="3"
+    CURRENT_BANTIME="$(get_sshd_value bantime)";  [[ -z "$CURRENT_BANTIME"  ]] && CURRENT_BANTIME="12h"
+    CURRENT_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CURRENT_FINDTIME" ]] && CURRENT_FINDTIME="21600"
+    CURRENT_PORT="$(get_sshd_value port)"; [[ -z "$CURRENT_PORT" ]] && CURRENT_PORT="22"
+
+    echo "================ 快捷修改 SSH 防爆破参数 ================"
+    echo "当前 SSH 配置："
+    echo "  port（SSH 端口）       : $CURRENT_PORT"
+    echo "  maxretry（失败次数）   : $CURRENT_MAXRETRY"
+    echo "  bantime（封禁时长）    : $CURRENT_BANTIME"
+    echo "  findtime（检测周期 秒）: $CURRENT_FINDTIME"
+    echo "---------------------------------------------------------"
+    echo "留空则表示不修改该项。"
+    echo "bantime 支持格式：600（秒）、12h、1d 等 Fail2ban 支持的时长格式。"
+    echo "findtime 用秒数，比如 21600 表示 6 小时。"
+    echo "========================================================="
+    echo ""
+
+    read -rp "请输入新的 maxretry（失败次数，例：3，留空不改）： " NEW_MAXRETRY
+    read -rp "请输入新的 bantime（封禁时长，例：12h 或 3600，留空不改）： " NEW_BANTIME
+    read -rp "请输入新的 findtime（检测周期秒数，例：21600，留空不改）： " NEW_FINDTIME
+
+    if [[ -z "$NEW_MAXRETRY" && -z "$NEW_BANTIME" && -z "$NEW_FINDTIME" ]]; then
+        echo "ℹ️ 未输入任何修改，保持原样。"
+        pause
+        return
+    fi
+
+    local FINAL_MAXRETRY FINAL_BANTIME FINAL_FINDTIME
+    FINAL_MAXRETRY="$CURRENT_MAXRETRY"
+    FINAL_BANTIME="$CURRENT_BANTIME"
+    FINAL_FINDTIME="$CURRENT_FINDTIME"
+
+    if [[ -n "$NEW_MAXRETRY" ]]; then
+        if ! [[ "$NEW_MAXRETRY" =~ ^[0-9]+$ ]]; then
+            echo "⚠ maxretry 必须是整数，已忽略该项修改。"
+        else
+            FINAL_MAXRETRY="$NEW_MAXRETRY"
+            echo "✅ maxretry 将修改为：$FINAL_MAXRETRY"
+        fi
+    fi
+
+    if [[ -n "$NEW_BANTIME" ]]; then
+        FINAL_BANTIME="$NEW_BANTIME"
+        echo "✅ bantime 将修改为：$FINAL_BANTIME"
+    fi
+
+    if [[ -n "$NEW_FINDTIME" ]]; then
+        if ! [[ "$NEW_FINDTIME" =~ ^[0-9]+$ ]]; then
+            echo "⚠ findtime 必须是整数秒数，已忽略该项修改。"
+        else
+            FINAL_FINDTIME="$NEW_FINDTIME"
+            echo "✅ findtime 将修改为：$FINAL_FINDTIME 秒"
+        fi
+    fi
+
+    local ACTION LOGPATH
+    ACTION="$(get_sshd_value action)"
+    [[ -z "$ACTION" ]] && ACTION="$(get_action_for_firewall)"
+    LOGPATH="$(get_sshd_value logpath)"
+    [[ -z "$LOGPATH" ]] && LOGPATH="$(pick_ssh_logpath)"
+
+    echo "🛠 更新 [sshd] 段..."
+    rewrite_or_append_sshd_block "$CURRENT_PORT" "$ACTION" "$LOGPATH" "$FINAL_MAXRETRY" "$FINAL_FINDTIME" "$FINAL_BANTIME"
+
+    echo "🔄 重启 Fail2ban 以应用新参数..."
+    if have_systemd; then
+        if ! systemctl restart fail2ban; then
+            echo "❌ Fail2ban 启动失败，请检查 $JAIL 是否有语法错误。"
+            pause
+            return
+        fi
+    else
+        service fail2ban restart >/dev/null 2>&1 || true
+    fi
+
+    echo ""
+    echo "✅ 修改已生效！"
+    pause
+}
+
+#-----------------------------
+# 1. 安装 / 配置 SSH 防爆破（安装 fb5 + 自动白名单当前 SSH 来源 IP）
 #-----------------------------
 install_or_config_ssh() {
     detect_os
@@ -924,7 +1192,8 @@ install_or_config_ssh() {
     echo "📦 包管理器: $(detect_pkg_mgr)"
     echo ""
 
-    local SSH_PORT=""; SSH_PORT="$(prompt_ssh_port)"
+    local SSH_PORT
+    SSH_PORT="$(prompt_ssh_port)"
 
     echo "📦 检查 Fail2ban 是否已安装..."
     if ! command -v fail2ban-client &>/dev/null; then
@@ -936,13 +1205,20 @@ install_or_config_ssh() {
             install_pkgs epel-release >/dev/null 2>&1 || true
             install_pkgs fail2ban fail2ban-firewalld || install_pkgs fail2ban
         fi
+    else
+        echo "✅ Fail2ban 已安装，跳过安装步骤。"
     fi
 
+    echo "📁 确保 /etc/fail2ban 目录存在..."
     mkdir -p /etc/fail2ban
+
     if [[ ! -f "$JAIL" ]]; then
+        echo "📄 创建新的 jail.local..."
         local MYIP="127.0.0.1"
-        local TMPIP=""; TMPIP=$(curl -s --max-time 5 https://api.ipify.org || true)
+        local TMPIP=""
+        TMPIP=$(curl -s --max-time 5 https://api.ipify.org || true)
         [[ -n "$TMPIP" ]] && MYIP="$TMPIP"
+
         cat > "$JAIL" <<EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 $MYIP
@@ -952,29 +1228,112 @@ maxretry = 3
 EOF
     fi
 
-    local CUR_SSH_IP=""; CUR_SSH_IP="$(get_current_ssh_client_ip 2>/dev/null || true)"
+    # 当前 SSH 来源 IP -> fail2ban ignoreip + SSH allowlist
+    local CUR_SSH_IP=""
+    CUR_SSH_IP="$(get_current_ssh_client_ip 2>/dev/null || true)"
     if [[ -n "$CUR_SSH_IP" ]]; then
+        echo "🧾 检测到当前 SSH 来源 IP：$CUR_SSH_IP"
         add_ip_to_ignoreip "$CUR_SSH_IP" || true
         ensure_allowlist_storage
         allowlist_add_ip "$CUR_SSH_IP" >/dev/null 2>&1 || true
+    else
+        echo "ℹ️ 未检测到 SSH 环境变量（可能是控制台执行），跳过自动白名单。"
     fi
 
-    local ACTION; ACTION="$(get_action_for_firewall)"
+    local ACTION
+    ACTION="$(get_action_for_firewall)"
+
     local CUR_MAXRETRY CUR_FINDTIME CUR_BANTIME
     CUR_MAXRETRY="$(get_sshd_value maxretry)"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="3"
     CUR_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="21600"
     CUR_BANTIME="$(get_sshd_value bantime)";  [[ -z "$CUR_BANTIME"  ]] && CUR_BANTIME="12h"
-    local LOGPATH; LOGPATH="$(pick_ssh_logpath)"
 
+    local LOGPATH
+    LOGPATH="$(pick_ssh_logpath)"
+
+    echo "🛡 写入/更新 SSH 防爆破配置到 jail.local（端口: $SSH_PORT）..."
     rewrite_or_append_sshd_block "$SSH_PORT" "$ACTION" "$LOGPATH" "$CUR_MAXRETRY" "$CUR_FINDTIME" "$CUR_BANTIME"
 
-    systemctl restart fail2ban || { echo "❌ Fail2ban 启动失败，请检查 $JAIL 语法。"; pause; return; }
-    systemctl enable fail2ban >/dev/null 2>&1 || true
+    echo "🔄 重启 Fail2ban..."
+    if have_systemd; then
+        if ! systemctl restart fail2ban; then
+            echo "❌ Fail2ban 启动失败，请检查 $JAIL 是否有语法错误。"
+            pause
+            return
+        fi
+        systemctl enable fail2ban >/dev/null 2>&1 || true
+    else
+        service fail2ban restart >/dev/null 2>&1 || true
+    fi
 
-    # 安装/修复 fb5 命令（确保新版本）
-    ensure_fb5_is_new || true
+    echo ""
+    echo "✅ SSH 防爆破配置完成！"
+    echo ""
+    echo "🔧 正在安装/修复快捷命令 fb5..."
+    ensure_fb5_is_new || install_fb5_now || true
 
-    echo "✅ SSH 防爆破配置完成。"
+    echo ""
+    echo "📌 查看详细状态：fail2ban-client status sshd"
+    echo "📌 立即可用命令：fb5"
+    echo "📌 SSH 白名单列表文件：$ALLOWLIST_FILE（菜单7可管理并启用）"
+    echo ""
+    pause
+}
+
+#-----------------------------
+# 3. 卸载本脚本相关配置（含白名单/兜底）
+#-----------------------------
+uninstall_all() {
+    echo "⚠ 此操作将删除："
+    echo "   - /etc/fail2ban/jail.local（若存在，会直接删除整个文件）"
+    echo "   - /etc/fb5（SSH 白名单列表/状态/端口覆盖）"
+    echo "   - systemd 兜底服务 fb5-ssh-allowlist（如存在）"
+    echo ""
+    read -rp "是否同时删除快捷命令 $INSTALL_CMD_PATH ? [y/N]: " RM_CMD
+    case "$RM_CMD" in
+        y|Y) rm -f "$INSTALL_CMD_PATH"; echo "✅ 已删除快捷命令：$INSTALL_CMD_PATH" ;;
+        *)   echo "已保留快捷命令（如存在）。" ;;
+    esac
+
+    read -rp "确认继续删除上述配置吗？[y/N]: " CONFIRM
+    case "$CONFIRM" in
+        y|Y) ;;
+        *)   echo "已取消卸载配置。"; pause; return ;;
+    esac
+
+    # 关闭白名单限制并清理
+    local port; port="$(get_effective_ssh_port)"
+    remove_allowlist_rules "$port" >/dev/null 2>&1 || true
+    remove_persist_A >/dev/null 2>&1 || true
+    disable_systemd_fallback >/dev/null 2>&1 || true
+    rm -rf "$ALLOWLIST_DIR" >/dev/null 2>&1 || true
+
+    # 停止 fail2ban 并删除配置
+    if have_systemd; then
+        systemctl stop fail2ban 2>/dev/null || true
+    else
+        service fail2ban stop >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/fail2ban/jail.local
+    echo "✅ Fail2ban 自定义配置文件已删除。"
+
+    read -rp "是否同时卸载 fail2ban 软件包？[y/N]: " CONFIRM2
+    case "$CONFIRM2" in
+        y|Y)
+            local PM; PM="$(detect_pkg_mgr)"
+            if [[ "$PM" == "apt" ]]; then
+                apt-get purge -y fail2ban || true
+            elif [[ "$PM" == "dnf" ]]; then
+                dnf remove -y fail2ban || true
+            elif [[ "$PM" == "yum" ]]; then
+                yum remove -y fail2ban || true
+            fi
+            have_systemd && systemctl disable fail2ban 2>/dev/null || true
+            echo "✅ fail2ban 软件包已卸载。"
+            ;;
+        *)  echo "已保留 fail2ban 软件包（但已无自定义配置）。" ;;
+    esac
+
     pause
 }
 
@@ -983,26 +1342,47 @@ EOF
 #-----------------------------
 print_status_summary() {
     echo "---------------- 当前运行状态 ----------------"
-    local fb_status="未知" fb_enabled="未知" sshd_jail="未知"
+    local fb_status="未知"
+    local fb_enabled="未知"
+    local sshd_jail="未知"
+
     if have_systemd; then
         systemctl is-active --quiet fail2ban && fb_status="运行中" || fb_status="未运行"
         systemctl is-enabled --quiet fail2ban 2>/dev/null && fb_enabled="是" || fb_enabled="否"
+    else
+        fb_status="未知（无 systemd）"
+        fb_enabled="未知"
     fi
+
     if command -v fail2ban-client &>/dev/null && have_systemd && systemctl is-active --quiet fail2ban; then
         fail2ban-client status sshd &>/dev/null && sshd_jail="已启用" || sshd_jail="未启用"
+    elif ! command -v fail2ban-client &>/dev/null; then
+        sshd_jail="未知（未安装 Fail2ban）"
+    else
+        sshd_jail="未知（Fail2ban 未运行）"
     fi
 
     local show_port="—"
     if [[ -f "$JAIL" ]] && grep -q "^\[sshd\]" "$JAIL"; then
-        show_port="$(get_sshd_value port)"; [[ -z "$show_port" ]] && show_port="—"
+        show_port="$(get_sshd_value port)"
+        [[ -z "$show_port" ]] && show_port="—"
     fi
 
     local fb5_status="未安装"
     [[ -x "$INSTALL_CMD_PATH" ]] && fb5_status="已安装($INSTALL_CMD_PATH)"
 
     local allow_status="未启用"
-    [[ -f "$ALLOWLIST_ENABLED_FLAG" ]] && allow_status="已启用"
-    [[ ! -f "$ALLOWLIST_ENABLED_FLAG" && -s "$ALLOWLIST_FILE" ]] && allow_status="已配置(未启用)"
+    if [[ -f "$ALLOWLIST_ENABLED_FLAG" ]]; then
+        allow_status="已启用"
+    elif [[ -s "$ALLOWLIST_FILE" ]]; then
+        allow_status="已配置(未启用)"
+    else
+        allow_status="未配置"
+    fi
+
+    local port_override="自动"
+    local ov=""; ov="$(read_ssh_port_override 2>/dev/null || true)"
+    [[ -n "$ov" ]] && port_override="$ov"
 
     local b_fallback="不可用"
     if have_systemd; then
@@ -1019,13 +1399,14 @@ print_status_summary() {
     echo "SSH 端口(记录于 fail2ban): $show_port"
     echo "快捷命令: $fb5_status"
     echo "SSH 白名单: $allow_status"
+    echo "白名单端口覆盖: $port_override"
     echo "白名单兜底(B): $b_fallback"
     echo "------------------------------------------------"
     echo ""
 }
 
 #-----------------------------
-# 命令行非交互入口：systemd 调用
+# 非交互入口：systemd 调用
 #-----------------------------
 cli_apply_allowlist() {
     detect_firewall
@@ -1036,8 +1417,6 @@ cli_apply_allowlist() {
     [[ -f "$ALLOWLIST_ENABLED_FLAG" ]] || exit 0
 
     local port; port="$(get_effective_ssh_port)"
-
-    # 若为空则自动关闭（安全）
     apply_allowlist_immediately_or_disable_if_empty "$port" >/dev/null 2>&1 || true
     exit 0
 }
@@ -1053,7 +1432,10 @@ main_menu() {
         echo " Author: DadaGi 大大怪"
         echo "==============================================="
         print_status_summary
-        echo " 1) 安装 / 配置 SSH 防爆破（自动加入当前 SSH IP）"
+        echo " 1) 安装 / 配置 SSH 防爆破（自动白名单当前 SSH IP + 自动安装 fb5）"
+        echo " 2) 快捷修改 SSH 防爆破参数（失败次数 / 封禁时长 / 检测周期）"
+        echo " 3) 卸载本脚本相关配置（可选卸载 fail2ban，含白名单/兜底清理）"
+        echo " 4) 远程更新 fb5 脚本（仅更新功能）"
         echo " 5) 查看 sshd 封禁 IP 列表"
         echo " 6) 解禁指定 IP（sshd）"
         echo " 7) SSH 连接白名单（新增/删除立即生效，重启自动恢复）"
@@ -1062,6 +1444,9 @@ main_menu() {
         read -rp "请输入选项 [0-7]: " CHOICE
         case "$CHOICE" in
             1) install_or_config_ssh ;;
+            2) modify_ssh_params ;;
+            3) uninstall_all ;;
+            4) update_fb5_from_remote ;;
             5) view_banned_ips ;;
             6) unban_ip ;;
             7) ssh_allowlist_menu ;;
