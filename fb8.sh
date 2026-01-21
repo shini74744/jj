@@ -18,7 +18,8 @@
 #      - 新增/删除后立即生效
 #      - 进入菜单7时会自动把当前 SSH 来源 IP 同步进白名单文件
 #      - 端口自动探测 + 可选覆盖（进入菜单7只问一次）
-#      - 持久化：优先方案A（系统原生），失败则方案B（systemd兜底）
+#      - 持久化：方案A写入系统原生（尽力而为）
+#      - 兜底：方案B systemd 服务【始终启用】(只要白名单启用)，保证重启后必定重新下发规则
 #
 # 默认策略（首次安装 / 无 [sshd] 参数时）：
 #   - maxretry = 3
@@ -711,11 +712,9 @@ get_effective_ssh_port() {
 
     # 2) sshd -T（含 include/drop-in 的生效配置）
     if command -v sshd >/dev/null 2>&1; then
-        # sshd -T 可能输出多行 "port X"
         local ports
         ports="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | tr '\n' ' ' | sed 's/  */ /g;s/^ *//;s/ *$//' || true)"
         if [[ -n "$ports" ]]; then
-            # 多端口时取第一个（菜单7会显示并可覆盖）
             echo "$ports" | awk '{print $1}'
             return 0
         fi
@@ -726,7 +725,6 @@ get_effective_ssh_port() {
         local p2
         p2="$(ss -lntp 2>/dev/null | awk '
             /sshd/ && $1 ~ /^LISTEN/ {
-                # Local Address:Port is in $4
                 n=split($4,a,":");
                 port=a[n];
                 if (port ~ /^[0-9]+$/) print port
@@ -769,7 +767,6 @@ get_effective_ssh_port() {
 }
 
 show_detected_ports_hint() {
-    # 给菜单7展示“可能的多个端口”，但最终仍由 get_effective_ssh_port（或覆盖）决定
     local sessionp=""
     sessionp="$(get_current_session_ssh_port 2>/dev/null || true)"
 
@@ -979,20 +976,24 @@ enable_allowlist_flag() { ensure_allowlist_storage; : > "$ALLOWLIST_ENABLED_FLAG
 disable_allowlist_flag() { rm -f "$ALLOWLIST_ENABLED_FLAG" >/dev/null 2>&1 || true; }
 
 #-----------------------------
-# 方案B：systemd 兜底
+# 方案B：systemd 兜底（关键：只要启用白名单，就始终启用B）
 #-----------------------------
 ensure_systemd_fallback_unit() {
     have_systemd || return 1
 
+    # 确保 fb5 命令存在（systemd ExecStart 依赖它）
     if [[ ! -x "$INSTALL_CMD_PATH" ]]; then
         install_fb5_now >/dev/null 2>&1 || true
     fi
+    [[ -x "$INSTALL_CMD_PATH" ]] || return 1
 
     cat > "$SYSTEMD_UNIT" <<EOF
 [Unit]
-Description=FB5 SSH Allowlist Enforcer (Fallback)
+Description=FB5 SSH Allowlist Enforcer (Boot Re-Apply)
 After=network-online.target
 Wants=network-online.target
+After=firewalld.service nftables.service
+Wants=firewalld.service nftables.service
 
 [Service]
 Type=oneshot
@@ -1021,7 +1022,7 @@ disable_systemd_fallback() {
 }
 
 #-----------------------------
-# 方案A：系统原生持久化（优先）
+# 方案A：系统原生持久化（尽力而为）
 #-----------------------------
 build_nft_persist_file() {
     local port="$1"
@@ -1207,7 +1208,7 @@ remove_persist_A() {
 }
 
 #-----------------------------
-# 核心：立即应用（运行时 + 持久化A优先 + 兜底B）
+# 核心：立即应用（运行时 + A尽力 + B强制启用保证重启恢复）
 #-----------------------------
 apply_allowlist_immediately_or_disable_if_empty() {
     local port="$1"
@@ -1227,24 +1228,31 @@ apply_allowlist_immediately_or_disable_if_empty() {
         echo "❌ 运行时规则应用失败（请检查防火墙状态/权限/冲突规则）。"
         return 1
     fi
+
+    # 标记启用
     enable_allowlist_flag
 
+    # 方案A：尽力写入（成功与否都不影响最终“重启可恢复”）
     if persist_allowlist_A "$port"; then
-        echo "✅ 持久化(A)成功：重启后仍会生效。"
-        disable_systemd_fallback >/dev/null 2>&1 || true
-        return 0
+        echo "✅ 持久化(A)已写入（系统原生机制）。"
+    else
+        echo "⚠ 持久化(A)未确认成功（不影响最终效果，将由兜底(B)保证重启恢复）。"
     fi
 
-    echo "⚠ 持久化(A)未能完成，将启用 systemd 兜底(B)以保证重启后恢复规则。"
-
-    if enable_systemd_fallback; then
-        echo "✅ 兜底(B)已启用：重启后会自动重新下发白名单规则。"
-        return 0
+    # 关键：只要白名单启用，就【始终】启用 systemd 兜底(B)，确保每次重启重放规则
+    if have_systemd; then
+        if enable_systemd_fallback; then
+            echo "✅ 兜底(B)已启用：重启后会自动重新下发白名单规则。"
+        else
+            echo "❌ 兜底(B)启用失败（可能无 systemd 或 /usr/local/bin/fb5 不可用）。"
+            echo "   该情况下只能依赖(A)；若(A)也不稳定，重启后可能失效。"
+            return 1
+        fi
+    else
+        echo "⚠ 系统无 systemd，无法启用兜底(B)。将仅依赖(A)持久化。"
     fi
 
-    echo "❌ 兜底(B)启用失败（可能无 systemd 或权限/路径问题）。"
-    echo "   当前规则仅对本次运行有效；重启后可能失效。"
-    return 1
+    return 0
 }
 
 confirm_or_override_port_once() {
@@ -1253,7 +1261,6 @@ confirm_or_override_port_once() {
     local existing=""
     existing="$(read_ssh_port_override 2>/dev/null || true)"
     if [[ -n "$existing" ]]; then
-        # 已有覆盖：不再打扰用户
         return 0
     fi
 
@@ -1291,7 +1298,6 @@ ssh_allowlist_menu() {
     ensure_allowlist_storage
     sync_current_ssh_ip_to_allowlist
 
-    # 进入菜单只问一次：端口确认/覆盖
     confirm_or_override_port_once
 
     local port
@@ -1422,14 +1428,12 @@ ssh_allowlist_menu() {
                     continue
                 fi
 
-                # 端口变更：如已启用白名单，立即把规则迁移到新端口
                 local new_port
                 new_port="$(get_effective_ssh_port)"
 
                 if [[ -f "$ALLOWLIST_ENABLED_FLAG" ]]; then
                     echo "🔁 检测到白名单已启用，将从端口 $old_port 迁移到端口 $new_port（立即生效）。"
                     remove_allowlist_rules "$old_port" || true
-                    # firewalld 的 persistent 需要用新端口重写；iptables/nftables 持久化由 apply 中处理
                     apply_allowlist_immediately_or_disable_if_empty "$new_port" || true
                 else
                     echo "ℹ️ 白名单当前未启用，仅更新端口设置。"
@@ -1659,7 +1663,6 @@ uninstall_all() {
     rm -f /etc/fail2ban/jail.local
     echo "✅ Fail2ban 自定义配置文件已删除。"
 
-    # 清理白名单限制（运行时+持久化+兜底）
     local port; port="$(get_effective_ssh_port)"
     remove_allowlist_rules "$port" || true
     remove_persist_A || true
@@ -1667,8 +1670,8 @@ uninstall_all() {
     rm -f "$SYSTEMD_UNIT" >/dev/null 2>&1 || true
     systemctl daemon-reload >/dev/null 2>&1 || true
 
-    # 清理端口覆盖
     clear_ssh_port_override || true
+    disable_allowlist_flag
 
     read -rp "是否同时卸载 fail2ban 软件包？[y/N]: " CONFIRM2
     case "$CONFIRM2" in
@@ -1759,7 +1762,7 @@ main_menu() {
         echo " 4) 远程更新 fb5 脚本（仅更新功能）"
         echo " 5) 查看 sshd 封禁 IP 列表"
         echo " 6) 解禁指定 IP（sshd）"
-        echo " 7) SSH 连接白名单（新增/删除后立即生效，A优先持久化+B兜底）"
+        echo " 7) SSH 连接白名单（新增/删除后立即生效，重启后也会恢复）"
         echo " 0) 退出"
         echo "-----------------------------------------------"
         read -rp "请输入选项 [0-7]: " CHOICE
