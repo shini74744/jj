@@ -23,6 +23,12 @@ create_swap() {
     # 参数1: swap文件大小（例如 2G）
     swap_size=$1
 
+    # 检查swap文件大小是否有效
+    if [[ ! "$swap_size" =~ ^[0-9]+[Gg]$ ]]; then
+        echo "请输入有效的swap文件大小（例如 2G 或 4G）。"
+        return 1
+    fi
+
     # 使用 fallocate 创建 swap 文件，如果 fallocate 失败则使用 dd
     echo "创建大小为 $swap_size 的swap文件..."
     
@@ -101,7 +107,7 @@ while true; do
             check_swap
             ;;
         2)
-            read -p "请输入要创建的swap文件大小 (例如 2G): " swap_size
+            read -p "请输入要创建的swap文件大小 (例如 2G 或 4G): " swap_size
             create_swap $swap_size
             ;;
         3)
