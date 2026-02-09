@@ -1,9 +1,19 @@
 #!/bin/bash
 
-# 查看当前swap使用情况
+# 查看当前swap使用情况，并反馈是否启动swap
 check_swap() {
-    echo "当前swap使用情况:"
-    free -h
+    echo "当前系统内存和swap使用情况:"
+    
+    # 使用 free 命令查看内存和swap信息
+    swap_status=$(free -h | grep Swap)
+
+    if [[ $swap_status == *"0B"* ]]; then
+        echo "没有启用swap!"
+    else
+        echo "$swap_status"
+        echo "当前swap已经启用，详细情况如下:"
+    fi
+
     echo "--------------------------"
 }
 
