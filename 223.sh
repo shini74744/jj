@@ -5,9 +5,10 @@ check_swap() {
     echo "当前系统内存和swap使用情况:"
     
     # 使用 free 命令查看内存和swap信息
-    swap_status=$(free -h | grep Swap)
+    swap_status=$(free -h)
 
-    if [[ $swap_status == *"0B"* ]]; then
+    if [[ $(echo "$swap_status" | grep -c "Swap:") -eq 1 && $(echo "$swap_status" | grep -c "0B") -eq 1 ]]; then
+        echo "$swap_status"
         echo "没有启用swap!"
     else
         echo "$swap_status"
