@@ -2,7 +2,7 @@
 
 # 查看当前swap使用情况，并反馈是否启动swap
 check_swap() {
-    echo "当前系统内存和swap使用情况:"
+    echo -e "\n当前系统内存和swap使用情况:"
     
     # 使用 free 命令查看内存和swap信息
     swap_status=$(free -h)
@@ -29,10 +29,9 @@ create_swap() {
         return 1
     fi
 
+    echo -e "\n创建大小为 $swap_size 的swap文件..."
+
     # 使用 fallocate 创建 swap 文件，如果 fallocate 失败则使用 dd
-    echo "创建大小为 $swap_size 的swap文件..."
-    
-    # 尝试使用 fallocate 创建文件
     if ! sudo fallocate -l $swap_size /swapfile; then
         echo "fallocate命令失败，尝试使用dd创建swap文件..."
         sudo dd if=/dev/zero of=/swapfile bs=1M count=$(( ${swap_size%G} * 1024 )) status=progress
@@ -62,6 +61,12 @@ set_swappiness() {
     # 参数1: swappiness值（0到100）
     swappiness_value=$1
 
+    # 验证swappiness值是否有效
+    if [[ ! "$swappiness_value" =~ ^[0-9]+$ ]] || [ "$swappiness_value" -lt 0 ] || [ "$swappiness_value" -gt 100 ]; then
+        echo "请输入一个有效的swappiness值 (0-100)。"
+        return 1
+    fi
+
     # 设置swappiness值
     sudo sysctl vm.swappiness=$swappiness_value
 
@@ -89,7 +94,7 @@ disable_swap() {
 
 # 主菜单函数
 show_menu() {
-    echo "请选择操作:"
+    echo -e "\n请选择操作:"
     echo "1. 查看当前swap使用情况"
     echo "2. 创建并启用swap文件"
     echo "3. 设置swappiness值"
@@ -100,7 +105,7 @@ show_menu() {
 # 主逻辑
 while true; do
     show_menu
-    read -p "请输入选择: " choice
+    read -p "请输入选择 (1-5): " choice
 
     case $choice in
         1)
