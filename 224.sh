@@ -81,35 +81,42 @@ disable_swap() {
     echo "--------------------------"
 }
 
-# 主菜单
-echo "请选择操作:"
-echo "1. 查看当前swap使用情况"
-echo "2. 创建并启用swap文件"
-echo "3. 设置swappiness值"
-echo "4. 禁用swap"
-echo "5. 退出"
-read -p "请输入选择: " choice
+# 主菜单函数
+show_menu() {
+    echo "请选择操作:"
+    echo "1. 查看当前swap使用情况"
+    echo "2. 创建并启用swap文件"
+    echo "3. 设置swappiness值"
+    echo "4. 禁用swap"
+    echo "5. 退出"
+}
 
-case $choice in
-    1)
-        check_swap
-        ;;
-    2)
-        read -p "请输入要创建的swap文件大小 (例如 2G): " swap_size
-        create_swap $swap_size
-        ;;
-    3)
-        read -p "请输入swappiness值 (0到100): " swappiness_value
-        set_swappiness $swappiness_value
-        ;;
-    4)
-        disable_swap
-        ;;
-    5)
-        echo "退出脚本"
-        exit 0
-        ;;
-    *)
-        echo "无效选项，请重新选择!"
-        ;;
-esac
+# 主逻辑
+while true; do
+    show_menu
+    read -p "请输入选择: " choice
+
+    case $choice in
+        1)
+            check_swap
+            ;;
+        2)
+            read -p "请输入要创建的swap文件大小 (例如 2G): " swap_size
+            create_swap $swap_size
+            ;;
+        3)
+            read -p "请输入swappiness值 (0到100): " swappiness_value
+            set_swappiness $swappiness_value
+            ;;
+        4)
+            disable_swap
+            ;;
+        5)
+            echo "退出脚本"
+            exit 0
+            ;;
+        *)
+            echo "无效选项，请重新选择!"
+            ;;
+    esac
+done
