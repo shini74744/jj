@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
 # ============================================================
-# Fail2ban SSH Protector 菜单版 (2025)
-# Author: DadaGi（大大怪）
+# Fail2ban SSH Protector 菜单版 + 3x-ui 扩展版 (2025/2026)
+# Author: DadaGi（大大怪） / 调整扩展版
 #
 # 功能：
-#   1) 安装 / 配置 Fail2ban 仅用于 SSH 防爆破（安装时输入 SSH 端口，回车默认 22）
-#      - 自动把当前 SSH 来源公网 IP 加入 ignoreip 白名单（避免误封自己）
-#      - 安装完成后自动安装 fb5 命令：/usr/local/bin/fb5（可直接 fb5 打开面板）
-#   2) 卸载本脚本相关配置（可选同时卸载 fail2ban）
-#   3) 快捷修改 SSH 防爆破参数（maxretry / bantime / findtime）
-#   4) 从远程更新 fb5 脚本（仅更新功能：下载覆盖并赋权）
-#   5) 查看当前封禁 IP 列表（sshd jail）
-#   6) 解禁指定 IP（sshd jail）
-#
-# 默认策略（首次安装 / 无 [sshd] 参数时）：
-#   - maxretry = 3
-#   - findtime = 21600（6小时）
-#   - bantime  = 12h
+#   1) 安装 / 配置 Fail2ban 仅用于 SSH 防爆破
+#   2) 快捷修改 SSH 防爆破参数
+#   3) 卸载本脚本相关配置（可选同时卸载 fail2ban）
+#   4) 从远程更新 fb5 脚本
+#   5) 查看当前封禁 IP 列表（sshd）
+#   6) 解禁指定 IP（sshd）
+#   7) 启用 / 配置 3x-ui TLS 扫描封禁
+#   8) 修改 3x-ui TLS 扫描封禁参数
+#   9) 查看 3x-ui TLS 扫描封禁 IP 列表
+#  10) 解禁指定 IP（3xui-tls）
+#  11) 启用 / 配置 3x-ui 登录失败封禁
+#  12) 修改 3x-ui 登录失败封禁参数
+#  13) 查看 3x-ui 登录失败封禁 IP 列表
+#  14) 解禁指定 IP（3xui-login）
 #
 # 说明：
-#   - 只对 [sshd] jail 动手
+#   - SSH 防护、3x-ui TLS 扫描防护、3x-ui 登录失败防护互相独立
+#   - 各自使用独立 filter / jail 文件，不会互相覆盖
+#   - 3x-ui 规则依赖 systemd journal（backend = systemd）
 # ============================================================
 
 set -e
@@ -32,6 +35,14 @@ FIREWALL=""
 JAIL="/etc/fail2ban/jail.local"
 INSTALL_CMD_PATH="/usr/local/bin/fb5"
 REMOTE_URL="https://raw.githubusercontent.com/shini74744/jj/refs/heads/main/fb5.sh"
+
+XUI_SERVICE_NAME="x-ui.service"
+
+XUI_TLS_FILTER="/etc/fail2ban/filter.d/3xui-tls.conf"
+XUI_TLS_JAIL="/etc/fail2ban/jail.d/3xui-tls.local"
+
+XUI_LOGIN_FILTER="/etc/fail2ban/filter.d/3xui-login.conf"
+XUI_LOGIN_JAIL="/etc/fail2ban/jail.d/3xui-login.local"
 
 #-----------------------------
 # 工具函数
@@ -50,23 +61,20 @@ ensure_root() {
 detect_os() {
     if [[ -n "$OS" ]]; then return; fi
 
-    # 优先使用 /etc/os-release
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
         . /etc/os-release || true
-        # ID 可能为：ubuntu/debian/centos/rhel/rocky/almalinux/fedora 等
         case "${ID:-}" in
             ubuntu) OS="ubuntu" ;;
             debian) OS="debian" ;;
             centos) OS="centos" ;;
-            rhel)   OS="rhel" ;;
-            rocky)  OS="rocky" ;;
+            rhel) OS="rhel" ;;
+            rocky) OS="rocky" ;;
             almalinux) OS="almalinux" ;;
             fedora) OS="fedora" ;;
             *) ;;
         esac
 
-        # 若 ID 未命中，尝试用 ID_LIKE 推断
         if [[ -z "$OS" ]]; then
             if grep -qiE "debian|ubuntu" <<<"${ID_LIKE:-}"; then
                 OS="debianlike"
@@ -78,7 +86,6 @@ detect_os() {
         [[ -n "$OS" ]] && return
     fi
 
-    # 兜底
     if [[ -f /etc/redhat-release ]]; then
         OS="rhellike"
     elif grep -qi "ubuntu" /etc/os-release 2>/dev/null; then
@@ -102,7 +109,7 @@ detect_firewall() {
 }
 
 #-----------------------------
-# 包管理器：探测 / 修复 / 安装（更稳健，覆盖主流发行版）
+# 包管理器：探测 / 修复 / 安装
 #-----------------------------
 detect_pkg_mgr() {
     if command -v apt-get >/dev/null 2>&1; then
@@ -117,8 +124,6 @@ detect_pkg_mgr() {
 }
 
 wait_for_apt_locks() {
-    # 等待 apt/dpkg 锁释放，避免“Could not get lock”
-    # 默认最多等 180 秒
     local max_wait="${1:-180}"
     local waited=0
 
@@ -140,17 +145,10 @@ fix_pkg_mgr_apt() {
     echo "📦 [APT] 尝试修复 dpkg/apt 状态（尽力而为，不阻断主流程）..."
 
     wait_for_apt_locks 180 || true
-
-    # 处理 dpkg 中断
     dpkg --configure -a || true
-
-    # 修复依赖
     apt-get -y -f install || true
-
-    # 清理缓存（减少索引/下载损坏影响）
     apt-get -y clean || true
 
-    # 更新索引：重试两次
     for i in 1 2; do
         if apt-get update -y; then
             echo "✅ [APT] apt-get update 成功"
@@ -160,15 +158,13 @@ fix_pkg_mgr_apt() {
         sleep 2
     done
 
-    # 再尝试一次依赖修复
     apt-get -y -f install || true
-
     echo "✅ [APT] 修复流程已执行完成（如仍有问题，后续安装仍会继续尝试）"
     return 0
 }
 
 fix_pkg_mgr_yum_dnf() {
-    local pm="$1"   # yum / dnf
+    local pm="$1"
     echo "📦 [${pm}] 尝试修复 yum/dnf 状态（尽力而为，不阻断主流程）..."
 
     if [[ "$pm" == "dnf" ]]; then
@@ -179,15 +175,12 @@ fix_pkg_mgr_yum_dnf() {
         yum -y makecache || true
     fi
 
-    # 处理残留事务（yum 上更常见）
     if command -v yum-complete-transaction >/dev/null 2>&1; then
         yum-complete-transaction -y || true
     elif [[ "$pm" == "dnf" ]]; then
-        # dnf 环境下尽力做一次 distro-sync（不强制）
         dnf -y distro-sync || true
     fi
 
-    # rpmdb 轻度修复
     if command -v rpm >/dev/null 2>&1; then
         rpm --rebuilddb >/dev/null 2>&1 || true
     fi
@@ -211,8 +204,6 @@ fix_pkg_mgr() {
 }
 
 install_pkgs() {
-    # 用当前系统可用的包管理器安装若干包：install_pkgs pkg1 pkg2 ...
-    # 目标：尽量提高成功率（失败时尽力修复并重试 1 次）
     local pm
     pm="$(detect_pkg_mgr)"
 
@@ -283,12 +274,26 @@ prompt_ssh_port() {
     while true; do
         read -rp "请输入 SSH 端口号（回车默认 22）: " p
         if [[ -z "$p" ]]; then
-            echo "22"; return
+            echo "22"
+            return
         fi
         if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); then
-            echo "$p"; return
+            echo "$p"
+            return
         fi
         echo "⚠ 端口号无效，请输入 1-65535 的整数，或直接回车默认 22。"
+    done
+}
+
+prompt_xui_port() {
+    local p=""
+    while true; do
+        read -rp "请输入 3x-ui 面板端口号（必填，例如 2053 / 54321）: " p
+        if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); then
+            echo "$p"
+            return
+        fi
+        echo "⚠ 端口号无效，请输入 1-65535 的整数。"
     done
 }
 
@@ -306,6 +311,27 @@ get_sshd_value() {
             }
         }
     ' "$JAIL" 2>/dev/null | tail -n1
+}
+
+get_ini_value_from_file() {
+    local file="$1"
+    local section="$2"
+    local key="$3"
+
+    [[ ! -f "$file" ]] && return 0
+
+    awk -v sec="$section" -v k="$key" '
+        BEGIN{in_sec=0}
+        $0 ~ "^\\[" sec "\\]$" {in_sec=1; next}
+        /^\[.*\]$/ {if(in_sec){in_sec=0}}
+        in_sec {
+            if ($0 ~ "^[[:space:]]*" k "[[:space:]]*=") {
+                sub("^[[:space:]]*" k "[[:space:]]*=[[:space:]]*", "", $0)
+                sub("[[:space:]]*$", "", $0)
+                print $0
+            }
+        }
+    ' "$file" | tail -n1
 }
 
 rewrite_or_append_sshd_block() {
@@ -367,12 +393,10 @@ EOF
 # 自动获取当前 SSH 来源 IP，并加入 ignoreip 白名单
 #-----------------------------
 get_current_ssh_client_ip() {
-    # SSH_CONNECTION: "clientip clientport serverip serverport"
     if [[ -n "${SSH_CONNECTION-}" ]]; then
         awk '{print $1}' <<<"$SSH_CONNECTION"
         return 0
     fi
-    # SSH_CLIENT: "clientip clientport serverport"
     if [[ -n "${SSH_CLIENT-}" ]]; then
         awk '{print $1}' <<<"$SSH_CLIENT"
         return 0
@@ -384,7 +408,6 @@ add_ip_to_ignoreip() {
     local ip="$1"
     [[ -z "$ip" ]] && return 1
 
-    # 轻度校验（允许 IPv6 冒号）
     if [[ "$ip" =~ [[:space:]] ]] || ! [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
         echo "⚠ 检测到的来源 IP 看起来不合法，跳过白名单：$ip"
         return 1
@@ -392,7 +415,6 @@ add_ip_to_ignoreip() {
 
     mkdir -p /etc/fail2ban
 
-    # 如果 jail.local 不存在，先创建一个最小 [DEFAULT]
     if [[ ! -f "$JAIL" ]]; then
         cat > "$JAIL" <<EOF
 [DEFAULT]
@@ -402,7 +424,6 @@ EOF
         return 0
     fi
 
-    # 如果没有 [DEFAULT] 段，就加到文件顶部
     if ! grep -q "^\[DEFAULT\]" "$JAIL"; then
         local tmpf
         tmpf="$(mktemp)"
@@ -416,7 +437,6 @@ EOF
         return 0
     fi
 
-    # 在 [DEFAULT] 段内：若有 ignoreip 行则追加；没有则插入一行
     local tmpfile
     tmpfile="$(mktemp)"
     awk -v ip="$ip" '
@@ -456,6 +476,18 @@ EOF
     return 0
 }
 
+build_xui_ignoreip() {
+    local ips="127.0.0.1/8 ::1"
+    local cur_ip=""
+    cur_ip="$(get_current_ssh_client_ip 2>/dev/null || true)"
+
+    if [[ -n "$cur_ip" ]] && [[ "$cur_ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
+        ips="$ips $cur_ip"
+    fi
+
+    echo "$ips"
+}
+
 #-----------------------------
 # fb5 安装（本地自安装优先，失败则远程下载兜底）
 #-----------------------------
@@ -487,7 +519,7 @@ install_fb5_now() {
 }
 
 #-----------------------------
-# Fail2ban 状态检查（用于 5/6）
+# Fail2ban 状态检查（用于 SSH）
 #-----------------------------
 ensure_fail2ban_ready() {
     if ! command -v fail2ban-client &>/dev/null; then
@@ -507,6 +539,197 @@ ensure_fail2ban_ready() {
         return 1
     fi
     return 0
+}
+
+ensure_jail_ready() {
+    local jail_name="$1"
+
+    if ! command -v fail2ban-client &>/dev/null; then
+        echo "❌ 未检测到 fail2ban-client（Fail2ban 可能未安装）。"
+        return 1
+    fi
+
+    if command -v systemctl &>/dev/null; then
+        if ! systemctl is-active --quiet fail2ban; then
+            echo "❌ Fail2ban 当前未运行（fail2ban 服务未 active）。"
+            echo "   可尝试：systemctl restart fail2ban"
+            return 1
+        fi
+    fi
+
+    if ! fail2ban-client status "$jail_name" &>/dev/null; then
+        echo "❌ $jail_name jail 未启用或无法查询。"
+        return 1
+    fi
+
+    return 0
+}
+
+ensure_xui_fail2ban_env() {
+    if ! command -v fail2ban-client &>/dev/null; then
+        echo "❌ 未检测到 fail2ban-client，请先执行菜单 1 安装/配置 Fail2ban。"
+        return 1
+    fi
+
+    if ! command -v systemctl &>/dev/null; then
+        echo "❌ 3x-ui 日志封禁功能依赖 systemd journal，当前系统未检测到 systemctl。"
+        return 1
+    fi
+
+    mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
+
+    if ! systemctl status x-ui >/dev/null 2>&1; then
+        echo "⚠ 未检测到 x-ui 服务正在运行，仍会写入规则，但请确认服务名确实是 x-ui。"
+        echo "   你可以手动检查：systemctl status x-ui"
+    fi
+
+    return 0
+}
+
+restart_fail2ban_or_return() {
+    echo "🔄 重启 Fail2ban..."
+    if ! systemctl restart fail2ban; then
+        echo "❌ Fail2ban 启动失败，请检查新写入的规则文件语法。"
+        pause
+        return 1
+    fi
+    return 0
+}
+
+show_jail_simple_status() {
+    local jail_name="$1"
+    echo ""
+    echo "================ ${jail_name} 状态 ================"
+    fail2ban-client status "$jail_name" 2>/dev/null || echo "⚠ 暂时无法读取 $jail_name 状态"
+    echo "=================================================="
+    echo ""
+}
+
+#-----------------------------
+# 通用：查看 / 解禁指定 jail 的 IP
+#-----------------------------
+view_banned_ips_for_jail() {
+    local jail_name="$1"
+    local title="$2"
+
+    if ! ensure_jail_ready "$jail_name"; then
+        pause
+        return
+    fi
+
+    echo "================ ${title} 当前封禁 IP ================"
+    if fail2ban-client get "$jail_name" banip &>/dev/null; then
+        local ips
+        ips="$(fail2ban-client get "$jail_name" banip | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+        if [[ -z "$ips" ]]; then
+            echo "✅ 当前无封禁 IP"
+        else
+            echo "$ips" | tr ' ' '\n'
+        fi
+    else
+        echo "（当前 fail2ban-client 不支持 get banip，改用 status 输出）"
+        fail2ban-client status "$jail_name" || true
+    fi
+    echo "====================================================="
+    echo ""
+    pause
+}
+
+unban_ip_for_jail() {
+    local jail_name="$1"
+    local title="$2"
+
+    if ! ensure_jail_ready "$jail_name"; then
+        pause
+        return
+    fi
+
+    local ip=""
+    read -rp "请输入要从 ${title} 解禁的 IP（IPv4/IPv6，回车取消）: " ip
+    if [[ -z "$ip" ]]; then
+        echo "已取消。"
+        pause
+        return
+    fi
+
+    if [[ "$ip" =~ [[:space:]] ]] || ! [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
+        echo "⚠ IP 格式看起来不正确：$ip"
+        pause
+        return
+    fi
+
+    if fail2ban-client set "$jail_name" unbanip "$ip" >/dev/null 2>&1; then
+        echo "✅ 已从 ${title} 解禁：$ip"
+    else
+        echo "❌ 解禁失败：$ip"
+        echo "   可能原因：该 IP 不在封禁列表中，或 fail2ban 运行异常。"
+    fi
+
+    echo ""
+    pause
+}
+
+#-----------------------------
+# XUI jail 文件写入器
+#-----------------------------
+write_3xui_tls_files() {
+    local panel_port="$1"
+    local action="$2"
+    local ignoreips="$3"
+    local maxretry="$4"
+    local findtime="$5"
+    local bantime="$6"
+
+    cat > "$XUI_TLS_FILTER" <<'EOF'
+[Definition]
+failregex = ^.*http: TLS handshake error from <HOST>:\d+:.*$
+ignoreregex =
+EOF
+
+    cat > "$XUI_TLS_JAIL" <<EOF
+[3xui-tls]
+enabled = true
+backend = systemd
+journalmatch = _SYSTEMD_UNIT=${XUI_SERVICE_NAME}
+filter = 3xui-tls
+port = $panel_port
+protocol = tcp
+maxretry = $maxretry
+findtime = $findtime
+bantime = $bantime
+ignoreip = $ignoreips
+action = $action
+EOF
+}
+
+write_3xui_login_files() {
+    local panel_port="$1"
+    local action="$2"
+    local ignoreips="$3"
+    local maxretry="$4"
+    local findtime="$5"
+    local bantime="$6"
+
+    cat > "$XUI_LOGIN_FILTER" <<'EOF'
+[Definition]
+failregex = ^.*WARNING - wrong username: .*IP:\s*"<HOST>"\s*$
+ignoreregex =
+EOF
+
+    cat > "$XUI_LOGIN_JAIL" <<EOF
+[3xui-login]
+enabled = true
+backend = systemd
+journalmatch = _SYSTEMD_UNIT=${XUI_SERVICE_NAME}
+filter = 3xui-login
+port = $panel_port
+protocol = tcp
+maxretry = $maxretry
+findtime = $findtime
+bantime = $bantime
+ignoreip = $ignoreips
+action = $action
+EOF
 }
 
 #-----------------------------
@@ -577,6 +800,8 @@ print_status_summary() {
     local fb_status="未知"
     local fb_enabled="未知"
     local sshd_jail="未知"
+    local xui_tls_jail="未启用"
+    local xui_login_jail="未启用"
 
     if command -v systemctl &>/dev/null; then
         if systemctl is-active --quiet fail2ban; then
@@ -601,10 +826,22 @@ print_status_summary() {
         else
             sshd_jail="未启用"
         fi
+
+        if fail2ban-client status 3xui-tls &>/dev/null; then
+            xui_tls_jail="已启用"
+        fi
+
+        if fail2ban-client status 3xui-login &>/dev/null; then
+            xui_login_jail="已启用"
+        fi
     elif ! command -v fail2ban-client &>/dev/null; then
         sshd_jail="未知（未安装 Fail2ban）"
+        xui_tls_jail="未知（未安装 Fail2ban）"
+        xui_login_jail="未知（未安装 Fail2ban）"
     else
         sshd_jail="未知（Fail2ban 未运行）"
+        xui_tls_jail="未知（Fail2ban 未运行）"
+        xui_login_jail="未知（Fail2ban 未运行）"
     fi
 
     local show_port="—"
@@ -613,6 +850,14 @@ print_status_summary() {
         [[ -z "$show_port" ]] && show_port="—"
     fi
 
+    local xui_tls_port="—"
+    [[ -f "$XUI_TLS_JAIL" ]] && xui_tls_port="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "port")"
+    [[ -z "$xui_tls_port" ]] && xui_tls_port="—"
+
+    local xui_login_port="—"
+    [[ -f "$XUI_LOGIN_JAIL" ]] && xui_login_port="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "port")"
+    [[ -z "$xui_login_port" ]] && xui_login_port="—"
+
     local fb5_status="未安装"
     [[ -x "$INSTALL_CMD_PATH" ]] && fb5_status="已安装($INSTALL_CMD_PATH)"
 
@@ -620,13 +865,15 @@ print_status_summary() {
     echo "开机启动: $fb_enabled"
     echo "SSH 防爆破 (sshd): $sshd_jail"
     echo "SSH 端口(记录于 fail2ban): $show_port"
+    echo "3x-ui TLS 扫描封禁: $xui_tls_jail (端口: $xui_tls_port)"
+    echo "3x-ui 登录失败封禁: $xui_login_jail (端口: $xui_login_port)"
     echo "快捷命令: $fb5_status"
     echo "------------------------------------------------"
     echo ""
 }
 
 #-----------------------------
-# 1. 安装 / 配置 SSH 防爆破（结束自动安装 fb5 + 自动白名单当前 SSH 来源 IP）
+# 1. 安装 / 配置 SSH 防爆破
 #-----------------------------
 install_or_config_ssh() {
     detect_os
@@ -638,15 +885,12 @@ install_or_config_ssh() {
     echo "📦 包管理器: $(detect_pkg_mgr)"
     echo ""
 
-    # ✅ 新版：尽力修复包管理器（不阻断主流程）
     echo "📦 检查并尽力修复包管理器状态（不中断主流程）..."
     fix_pkg_mgr || true
 
-    # 提示用户输入 SSH 端口（复用函数）
     local SSH_PORT=""
     SSH_PORT="$(prompt_ssh_port)"
 
-    # 检查 Fail2ban 是否已经安装
     echo "📦 检查 Fail2ban 是否已安装..."
     if command -v fail2ban-client &>/dev/null; then
         echo "✅ Fail2ban 已安装，跳过安装步骤。"
@@ -658,14 +902,12 @@ install_or_config_ssh() {
         if [[ "$PM" == "apt" ]]; then
             install_pkgs fail2ban
         elif [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
-            # 尽力启用 EPEL（Fedora/部分环境可能不需要；失败不阻断）
             if install_pkgs epel-release >/dev/null 2>&1; then
                 echo "✅ 已尝试安装/启用 epel-release"
             else
                 echo "ℹ️ epel-release 不可用或安装失败（将继续尝试安装 fail2ban）"
             fi
 
-            # 某些环境有 fail2ban-firewalld；没有也无妨
             install_pkgs fail2ban fail2ban-firewalld || install_pkgs fail2ban
         else
             echo "❌ 未识别包管理器，无法自动安装 Fail2ban。"
@@ -677,7 +919,6 @@ install_or_config_ssh() {
     echo "📁 确保 /etc/fail2ban 目录存在..."
     mkdir -p /etc/fail2ban
 
-    # 创建 jail.local 基础配置（仅当文件不存在）
     if [[ ! -f "$JAIL" ]]; then
         echo "📄 创建新的 jail.local..."
         local MYIP="127.0.0.1"
@@ -694,7 +935,6 @@ maxretry = 3
 EOF
     fi
 
-    # ✅ 自动把当前 SSH 来源 IP 加入 ignoreip 白名单
     local CUR_SSH_IP=""
     CUR_SSH_IP="$(get_current_ssh_client_ip 2>/dev/null || true)"
     if [[ -n "$CUR_SSH_IP" ]]; then
@@ -837,12 +1077,292 @@ modify_ssh_params() {
 }
 
 #-----------------------------
+# 7. 启用 / 配置 3x-ui TLS 扫描封禁
+#-----------------------------
+enable_3xui_tls_protection() {
+    if ! ensure_xui_fail2ban_env; then
+        pause
+        return
+    fi
+
+    detect_firewall
+
+    local PANEL_PORT ACTION IGNOREIPS
+    local CUR_MAXRETRY CUR_FINDTIME CUR_BANTIME
+
+    PANEL_PORT="$(prompt_xui_port)"
+    ACTION="$(get_action_for_firewall)"
+    IGNOREIPS="$(build_xui_ignoreip)"
+
+    CUR_MAXRETRY="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "maxretry")"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="8"
+    CUR_FINDTIME="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "findtime")"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="300"
+    CUR_BANTIME="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "bantime")"; [[ -z "$CUR_BANTIME" ]] && CUR_BANTIME="6h"
+
+    echo "🛡 正在启用 / 更新 3x-ui TLS 异常扫描封禁..."
+    echo "   面板端口: $PANEL_PORT"
+    echo "   防火墙动作: $ACTION"
+    echo "   白名单: $IGNOREIPS"
+    echo "   maxretry: $CUR_MAXRETRY"
+    echo "   findtime: $CUR_FINDTIME"
+    echo "   bantime: $CUR_BANTIME"
+    echo ""
+
+    write_3xui_tls_files "$PANEL_PORT" "$ACTION" "$IGNOREIPS" "$CUR_MAXRETRY" "$CUR_FINDTIME" "$CUR_BANTIME"
+
+    if ! restart_fail2ban_or_return; then
+        return
+    fi
+
+    echo "✅ 3x-ui TLS 扫描封禁已启用。"
+    echo "   当前策略：${CUR_FINDTIME} 秒内达到 ${CUR_MAXRETRY} 次 TLS 握手异常，则封禁 ${CUR_BANTIME}。"
+    show_jail_simple_status "3xui-tls"
+    pause
+}
+
+#-----------------------------
+# 8. 修改 3x-ui TLS 扫描封禁参数
+#-----------------------------
+modify_3xui_tls_params() {
+    if [[ ! -f "$XUI_TLS_JAIL" ]]; then
+        echo "⚠ 未检测到 $XUI_TLS_JAIL，请先执行『7) 启用 / 配置 3x-ui TLS 扫描封禁』"
+        pause
+        return
+    fi
+
+    local CURRENT_PORT CURRENT_MAXRETRY CURRENT_FINDTIME CURRENT_BANTIME CURRENT_ACTION CURRENT_IGNOREIP
+    CURRENT_PORT="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "port")"; [[ -z "$CURRENT_PORT" ]] && CURRENT_PORT="$(prompt_xui_port)"
+    CURRENT_MAXRETRY="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "maxretry")"; [[ -z "$CURRENT_MAXRETRY" ]] && CURRENT_MAXRETRY="8"
+    CURRENT_FINDTIME="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "findtime")"; [[ -z "$CURRENT_FINDTIME" ]] && CURRENT_FINDTIME="300"
+    CURRENT_BANTIME="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "bantime")"; [[ -z "$CURRENT_BANTIME" ]] && CURRENT_BANTIME="6h"
+    CURRENT_ACTION="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "action")"; [[ -z "$CURRENT_ACTION" ]] && CURRENT_ACTION="$(get_action_for_firewall)"
+    CURRENT_IGNOREIP="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "ignoreip")"; [[ -z "$CURRENT_IGNOREIP" ]] && CURRENT_IGNOREIP="$(build_xui_ignoreip)"
+
+    echo "================ 修改 3x-ui TLS 扫描封禁参数 ================"
+    echo "当前配置："
+    echo "  port（面板端口）       : $CURRENT_PORT"
+    echo "  maxretry（失败次数）   : $CURRENT_MAXRETRY"
+    echo "  bantime（封禁时长）    : $CURRENT_BANTIME"
+    echo "  findtime（检测周期 秒）: $CURRENT_FINDTIME"
+    echo "-------------------------------------------------------------"
+    echo "留空则表示不修改该项。"
+    echo "bantime 支持格式：600、12h、1d"
+    echo "findtime 用秒数，比如 300 表示 5 分钟。"
+    echo "============================================================="
+    echo ""
+
+    read -rp "请输入新的 maxretry（失败次数，例：8，留空不改）： " NEW_MAXRETRY
+    read -rp "请输入新的 bantime（封禁时长，例：6h 或 3600，留空不改）： " NEW_BANTIME
+    read -rp "请输入新的 findtime（检测周期秒数，例：300，留空不改）： " NEW_FINDTIME
+
+    if [[ -z "$NEW_MAXRETRY" && -z "$NEW_BANTIME" && -z "$NEW_FINDTIME" ]]; then
+        echo "ℹ️ 未输入任何修改，保持原样。"
+        pause
+        return
+    fi
+
+    local FINAL_MAXRETRY FINAL_BANTIME FINAL_FINDTIME
+    FINAL_MAXRETRY="$CURRENT_MAXRETRY"
+    FINAL_BANTIME="$CURRENT_BANTIME"
+    FINAL_FINDTIME="$CURRENT_FINDTIME"
+
+    if [[ -n "$NEW_MAXRETRY" ]]; then
+        if ! [[ "$NEW_MAXRETRY" =~ ^[0-9]+$ ]]; then
+            echo "⚠ maxretry 必须是整数，已忽略该项修改。"
+        else
+            FINAL_MAXRETRY="$NEW_MAXRETRY"
+            echo "✅ maxretry 将修改为：$FINAL_MAXRETRY"
+        fi
+    fi
+
+    if [[ -n "$NEW_BANTIME" ]]; then
+        FINAL_BANTIME="$NEW_BANTIME"
+        echo "✅ bantime 将修改为：$FINAL_BANTIME"
+    fi
+
+    if [[ -n "$NEW_FINDTIME" ]]; then
+        if ! [[ "$NEW_FINDTIME" =~ ^[0-9]+$ ]]; then
+            echo "⚠ findtime 必须是整数秒数，已忽略该项修改。"
+        else
+            FINAL_FINDTIME="$NEW_FINDTIME"
+            echo "✅ findtime 将修改为：$FINAL_FINDTIME 秒"
+        fi
+    fi
+
+    write_3xui_tls_files "$CURRENT_PORT" "$CURRENT_ACTION" "$CURRENT_IGNOREIP" "$FINAL_MAXRETRY" "$FINAL_FINDTIME" "$FINAL_BANTIME"
+
+    if ! restart_fail2ban_or_return; then
+        return
+    fi
+
+    echo "✅ 3x-ui TLS 扫描封禁参数已更新。"
+    show_jail_simple_status "3xui-tls"
+    pause
+}
+
+#-----------------------------
+# 9. 查看 3x-ui TLS 扫描封禁 IP 列表
+#-----------------------------
+view_3xui_tls_banned_ips() {
+    view_banned_ips_for_jail "3xui-tls" "3xui-tls"
+}
+
+#-----------------------------
+# 10. 解禁指定 IP（3xui-tls）
+#-----------------------------
+unban_3xui_tls_ip() {
+    unban_ip_for_jail "3xui-tls" "3xui-tls"
+}
+
+#-----------------------------
+# 11. 启用 / 配置 3x-ui 登录失败封禁
+#-----------------------------
+enable_3xui_login_protection() {
+    if ! ensure_xui_fail2ban_env; then
+        pause
+        return
+    fi
+
+    detect_firewall
+
+    local PANEL_PORT ACTION IGNOREIPS
+    local CUR_MAXRETRY CUR_FINDTIME CUR_BANTIME
+
+    PANEL_PORT="$(prompt_xui_port)"
+    ACTION="$(get_action_for_firewall)"
+    IGNOREIPS="$(build_xui_ignoreip)"
+
+    CUR_MAXRETRY="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "maxretry")"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="5"
+    CUR_FINDTIME="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "findtime")"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="600"
+    CUR_BANTIME="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "bantime")"; [[ -z "$CUR_BANTIME" ]] && CUR_BANTIME="12h"
+
+    echo "🛡 正在启用 / 更新 3x-ui 面板登录失败封禁..."
+    echo "   面板端口: $PANEL_PORT"
+    echo "   防火墙动作: $ACTION"
+    echo "   白名单: $IGNOREIPS"
+    echo "   maxretry: $CUR_MAXRETRY"
+    echo "   findtime: $CUR_FINDTIME"
+    echo "   bantime: $CUR_BANTIME"
+    echo ""
+
+    write_3xui_login_files "$PANEL_PORT" "$ACTION" "$IGNOREIPS" "$CUR_MAXRETRY" "$CUR_FINDTIME" "$CUR_BANTIME"
+
+    if ! restart_fail2ban_or_return; then
+        return
+    fi
+
+    echo "✅ 3x-ui 登录失败封禁已启用。"
+    echo "   当前策略：${CUR_FINDTIME} 秒内达到 ${CUR_MAXRETRY} 次错误登录，则封禁 ${CUR_BANTIME}。"
+    echo "⚠ 注意：请确认 3x-ui 失败登录日志里的 IP 是真实来访 IP。"
+    show_jail_simple_status "3xui-login"
+    pause
+}
+
+#-----------------------------
+# 12. 修改 3x-ui 登录失败封禁参数
+#-----------------------------
+modify_3xui_login_params() {
+    if [[ ! -f "$XUI_LOGIN_JAIL" ]]; then
+        echo "⚠ 未检测到 $XUI_LOGIN_JAIL，请先执行『11) 启用 / 配置 3x-ui 登录失败封禁』"
+        pause
+        return
+    fi
+
+    local CURRENT_PORT CURRENT_MAXRETRY CURRENT_FINDTIME CURRENT_BANTIME CURRENT_ACTION CURRENT_IGNOREIP
+    CURRENT_PORT="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "port")"; [[ -z "$CURRENT_PORT" ]] && CURRENT_PORT="$(prompt_xui_port)"
+    CURRENT_MAXRETRY="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "maxretry")"; [[ -z "$CURRENT_MAXRETRY" ]] && CURRENT_MAXRETRY="5"
+    CURRENT_FINDTIME="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "findtime")"; [[ -z "$CURRENT_FINDTIME" ]] && CURRENT_FINDTIME="600"
+    CURRENT_BANTIME="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "bantime")"; [[ -z "$CURRENT_BANTIME" ]] && CURRENT_BANTIME="12h"
+    CURRENT_ACTION="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "action")"; [[ -z "$CURRENT_ACTION" ]] && CURRENT_ACTION="$(get_action_for_firewall)"
+    CURRENT_IGNOREIP="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "ignoreip")"; [[ -z "$CURRENT_IGNOREIP" ]] && CURRENT_IGNOREIP="$(build_xui_ignoreip)"
+
+    echo "================ 修改 3x-ui 登录失败封禁参数 ================"
+    echo "当前配置："
+    echo "  port（面板端口）       : $CURRENT_PORT"
+    echo "  maxretry（失败次数）   : $CURRENT_MAXRETRY"
+    echo "  bantime（封禁时长）    : $CURRENT_BANTIME"
+    echo "  findtime（检测周期 秒）: $CURRENT_FINDTIME"
+    echo "-------------------------------------------------------------"
+    echo "留空则表示不修改该项。"
+    echo "bantime 支持格式：600、12h、1d"
+    echo "findtime 用秒数，比如 600 表示 10 分钟。"
+    echo "============================================================="
+    echo ""
+
+    read -rp "请输入新的 maxretry（失败次数，例：5，留空不改）： " NEW_MAXRETRY
+    read -rp "请输入新的 bantime（封禁时长，例：12h 或 3600，留空不改）： " NEW_BANTIME
+    read -rp "请输入新的 findtime（检测周期秒数，例：600，留空不改）： " NEW_FINDTIME
+
+    if [[ -z "$NEW_MAXRETRY" && -z "$NEW_BANTIME" && -z "$NEW_FINDTIME" ]]; then
+        echo "ℹ️ 未输入任何修改，保持原样。"
+        pause
+        return
+    fi
+
+    local FINAL_MAXRETRY FINAL_BANTIME FINAL_FINDTIME
+    FINAL_MAXRETRY="$CURRENT_MAXRETRY"
+    FINAL_BANTIME="$CURRENT_BANTIME"
+    FINAL_FINDTIME="$CURRENT_FINDTIME"
+
+    if [[ -n "$NEW_MAXRETRY" ]]; then
+        if ! [[ "$NEW_MAXRETRY" =~ ^[0-9]+$ ]]; then
+            echo "⚠ maxretry 必须是整数，已忽略该项修改。"
+        else
+            FINAL_MAXRETRY="$NEW_MAXRETRY"
+            echo "✅ maxretry 将修改为：$FINAL_MAXRETRY"
+        fi
+    fi
+
+    if [[ -n "$NEW_BANTIME" ]]; then
+        FINAL_BANTIME="$NEW_BANTIME"
+        echo "✅ bantime 将修改为：$FINAL_BANTIME"
+    fi
+
+    if [[ -n "$NEW_FINDTIME" ]]; then
+        if ! [[ "$NEW_FINDTIME" =~ ^[0-9]+$ ]]; then
+            echo "⚠ findtime 必须是整数秒数，已忽略该项修改。"
+        else
+            FINAL_FINDTIME="$NEW_FINDTIME"
+            echo "✅ findtime 将修改为：$FINAL_FINDTIME 秒"
+        fi
+    fi
+
+    write_3xui_login_files "$CURRENT_PORT" "$CURRENT_ACTION" "$CURRENT_IGNOREIP" "$FINAL_MAXRETRY" "$FINAL_FINDTIME" "$FINAL_BANTIME"
+
+    if ! restart_fail2ban_or_return; then
+        return
+    fi
+
+    echo "✅ 3x-ui 登录失败封禁参数已更新。"
+    show_jail_simple_status "3xui-login"
+    pause
+}
+
+#-----------------------------
+# 13. 查看 3x-ui 登录失败封禁 IP 列表
+#-----------------------------
+view_3xui_login_banned_ips() {
+    view_banned_ips_for_jail "3xui-login" "3xui-login"
+}
+
+#-----------------------------
+# 14. 解禁指定 IP（3xui-login）
+#-----------------------------
+unban_3xui_login_ip() {
+    unban_ip_for_jail "3xui-login" "3xui-login"
+}
+
+#-----------------------------
 # 3. 卸载本脚本相关配置
 #-----------------------------
 uninstall_all() {
     echo "⚠ 此操作将删除："
     echo "   - /etc/fail2ban/jail.local（若存在，会直接删除整个文件）"
+    echo "   - $XUI_TLS_FILTER"
+    echo "   - $XUI_TLS_JAIL"
+    echo "   - $XUI_LOGIN_FILTER"
+    echo "   - $XUI_LOGIN_JAIL"
     echo ""
+
     read -rp "是否同时删除快捷命令 $INSTALL_CMD_PATH ? [y/N]: " RM_CMD
     case "$RM_CMD" in
         y|Y) rm -f "$INSTALL_CMD_PATH"; echo "✅ 已删除快捷命令：$INSTALL_CMD_PATH" ;;
@@ -857,7 +1377,8 @@ uninstall_all() {
 
     systemctl stop fail2ban 2>/dev/null || true
     rm -f /etc/fail2ban/jail.local
-    echo "✅ Fail2ban 自定义配置文件已删除。"
+    rm -f "$XUI_TLS_FILTER" "$XUI_TLS_JAIL" "$XUI_LOGIN_FILTER" "$XUI_LOGIN_JAIL"
+    echo "✅ 本脚本相关 Fail2ban 配置文件已删除。"
 
     read -rp "是否同时卸载 fail2ban 软件包？[y/N]: " CONFIRM2
     case "$CONFIRM2" in
@@ -876,7 +1397,7 @@ uninstall_all() {
             systemctl disable fail2ban 2>/dev/null || true
             echo "✅ fail2ban 软件包已卸载。"
             ;;
-        *)  echo "已保留 fail2ban 软件包（但已无自定义配置）。" ;;
+        *)  echo "已保留 fail2ban 软件包（但已删除本脚本配置）。" ;;
     esac
 
     pause
@@ -920,10 +1441,10 @@ update_fb5_from_remote() {
 main_menu() {
     while true; do
         clear
-        echo "==============================================="
-        echo " Fail2ban SSH 防爆破 管理脚本"
-        echo " Author: DadaGi 大大怪"
-        echo "==============================================="
+        echo "=========================================================="
+        echo " Fail2ban SSH / 3x-ui 防爆破 管理脚本"
+        echo " Author: DadaGi 大大怪 + 扩展版"
+        echo "=========================================================="
         print_status_summary
         echo " 1) 安装 / 配置 SSH 防爆破（自动白名单当前 SSH IP + 自动安装 fb5）"
         echo " 2) 快捷修改 SSH 防爆破参数（失败次数 / 封禁时长 / 检测周期）"
@@ -931,9 +1452,17 @@ main_menu() {
         echo " 4) 远程更新 fb5 脚本（仅更新功能）"
         echo " 5) 查看 sshd 封禁 IP 列表"
         echo " 6) 解禁指定 IP（sshd）"
+        echo " 7) 启用 / 配置 3x-ui TLS 扫描封禁"
+        echo " 8) 修改 3x-ui TLS 扫描封禁参数"
+        echo " 9) 查看 3x-ui TLS 扫描封禁 IP 列表"
+        echo "10) 解禁指定 IP（3xui-tls）"
+        echo "11) 启用 / 配置 3x-ui 登录失败封禁"
+        echo "12) 修改 3x-ui 登录失败封禁参数"
+        echo "13) 查看 3x-ui 登录失败封禁 IP 列表"
+        echo "14) 解禁指定 IP（3xui-login）"
         echo " 0) 退出"
-        echo "-----------------------------------------------"
-        read -rp "请输入选项 [0-6]: " CHOICE
+        echo "----------------------------------------------------------"
+        read -rp "请输入选项 [0-14]: " CHOICE
         case "$CHOICE" in
             1) install_or_config_ssh ;;
             2) modify_ssh_params ;;
@@ -941,6 +1470,14 @@ main_menu() {
             4) update_fb5_from_remote ;;
             5) view_banned_ips ;;
             6) unban_ip ;;
+            7) enable_3xui_tls_protection ;;
+            8) modify_3xui_tls_params ;;
+            9) view_3xui_tls_banned_ips ;;
+            10) unban_3xui_tls_ip ;;
+            11) enable_3xui_login_protection ;;
+            12) modify_3xui_login_params ;;
+            13) view_3xui_login_banned_ips ;;
+            14) unban_3xui_login_ip ;;
             0) echo "已退出。"; exit 0 ;;
             *) echo "❌ 无效选项。"; pause ;;
         esac
