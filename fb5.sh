@@ -30,6 +30,21 @@ XUI_LOGIN_JAIL="/etc/fail2ban/jail.d/3xui-login.local"
 XUI_NFT_ALL_ACTION="/etc/fail2ban/action.d/xui-nftables-all.conf"
 
 #-----------------------------
+# 默认参数（新机器首次安装时使用）
+#-----------------------------
+SSH_DEFAULT_MAXRETRY="3" #次数
+SSH_DEFAULT_FINDTIME="1d" #检测周期
+SSH_DEFAULT_BANTIME="-1" #封禁时间
+
+XUI_TLS_DEFAULT_MAXRETRY="5" #次数
+XUI_TLS_DEFAULT_FINDTIME="1d" #检测周期
+XUI_TLS_DEFAULT_BANTIME="1h" #封禁时间
+
+XUI_LOGIN_DEFAULT_MAXRETRY="3" #次数
+XUI_LOGIN_DEFAULT_FINDTIME="1d" #检测周期
+XUI_LOGIN_DEFAULT_BANTIME="-1" #封禁时间
+
+#-----------------------------
 # 工具函数
 #-----------------------------
 pause() {
@@ -1034,9 +1049,9 @@ install_or_config_ssh() {
         cat > "$JAIL" <<EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 $MYIP
-bantime  = 12h
-findtime = 6h
-maxretry = 3
+bantime  = $SSH_DEFAULT_BANTIME
+findtime = $SSH_DEFAULT_FINDTIME
+maxretry = $SSH_DEFAULT_MAXRETRY
 EOF
     fi
 
@@ -1053,9 +1068,9 @@ EOF
     ACTION="$(get_ssh_action_for_firewall)"
 
     local CUR_MAXRETRY CUR_FINDTIME CUR_BANTIME
-    CUR_MAXRETRY="$(get_sshd_value maxretry)"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="3"
-    CUR_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="21600"
-    CUR_BANTIME="$(get_sshd_value bantime)";  [[ -z "$CUR_BANTIME"  ]] && CUR_BANTIME="12h"
+    CUR_MAXRETRY="$(get_sshd_value maxretry)"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="$SSH_DEFAULT_MAXRETRY"
+    CUR_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="$SSH_DEFAULT_FINDTIME"
+    CUR_BANTIME="$(get_sshd_value bantime)";  [[ -z "$CUR_BANTIME"  ]] && CUR_BANTIME="$SSH_DEFAULT_BANTIME"
 
     local LOGPATH
     LOGPATH="$(pick_ssh_logpath)"
@@ -1193,9 +1208,9 @@ enable_3xui_tls_protection() {
     ACTION="$(get_xui_allhost_action)"
     IGNOREIPS="$(build_xui_ignoreip)"
 
-    CUR_MAXRETRY="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "maxretry")"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="8"
-    CUR_FINDTIME="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "findtime")"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="300"
-    CUR_BANTIME="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "bantime")"; [[ -z "$CUR_BANTIME" ]] && CUR_BANTIME="6h"
+    CUR_MAXRETRY="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "maxretry")"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="$XUI_TLS_DEFAULT_MAXRETRY"
+    CUR_FINDTIME="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "findtime")"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="$XUI_TLS_DEFAULT_FINDTIME"
+    CUR_BANTIME="$(get_ini_value_from_file "$XUI_TLS_JAIL" "3xui-tls" "bantime")"; [[ -z "$CUR_BANTIME" ]] && CUR_BANTIME="$XUI_TLS_DEFAULT_BANTIME"
 
     echo "🛡 正在启用 / 更新 3x-ui TLS 异常扫描封禁（被 ban 后整机拦）..."
     echo "   记录端口: $PANEL_PORT"
@@ -1349,9 +1364,9 @@ enable_3xui_login_protection() {
     ACTION="$(get_xui_allhost_action)"
     IGNOREIPS="$(build_xui_ignoreip)"
 
-    CUR_MAXRETRY="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "maxretry")"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="5"
-    CUR_FINDTIME="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "findtime")"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="600"
-    CUR_BANTIME="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "bantime")"; [[ -z "$CUR_BANTIME" ]] && CUR_BANTIME="12h"
+    CUR_MAXRETRY="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "maxretry")"; [[ -z "$CUR_MAXRETRY" ]] && CUR_MAXRETRY="$XUI_LOGIN_DEFAULT_MAXRETRY"
+    CUR_FINDTIME="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "findtime")"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="$XUI_LOGIN_DEFAULT_FINDTIME"
+    CUR_BANTIME="$(get_ini_value_from_file "$XUI_LOGIN_JAIL" "3xui-login" "bantime")"; [[ -z "$CUR_BANTIME" ]] && CUR_BANTIME="$XUI_LOGIN_DEFAULT_BANTIME"
 
     echo "🛡 正在启用 / 更新 3x-ui 面板登录失败封禁（被 ban 后整机拦）..."
     echo "   记录端口: $PANEL_PORT"
