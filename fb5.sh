@@ -304,6 +304,18 @@ prompt_xui_port() {
     done
 }
 
+is_valid_bantime() {
+    local v="$1"
+    [[ -z "$v" ]] && return 1
+    [[ "$v" =~ ^-1$ || "$v" =~ ^[0-9]+([smhdw])?$ ]]
+}
+
+is_valid_findtime() {
+    local v="$1"
+    [[ -z "$v" ]] && return 1
+    [[ "$v" =~ ^[0-9]+([smhdw])?$ ]]
+}
+
 get_sshd_value() {
     local key="$1"
     awk -v k="$key" '
@@ -1058,17 +1070,17 @@ modify_ssh_params() {
     echo "  port（SSH 端口）       : $CURRENT_PORT"
     echo "  maxretry（失败次数）   : $CURRENT_MAXRETRY"
     echo "  bantime（封禁时长）    : $CURRENT_BANTIME"
-    echo "  findtime（检测周期 秒）: $CURRENT_FINDTIME"
+    echo "  findtime（检测周期）   : $CURRENT_FINDTIME"
     echo "---------------------------------------------------------"
     echo "留空则表示不修改该项。"
-    echo "bantime 支持格式：600（秒）、12h、1d 等 Fail2ban 支持的时长格式。"
-    echo "findtime 用秒数，比如 21600 表示 6 小时。"
+    echo "bantime 支持：600 / 12h / 1d / 1w / -1（永久封禁）"
+    echo "findtime 支持：600 / 30m / 1h / 1d / 1w"
     echo "========================================================="
     echo ""
 
     read -rp "请输入新的 maxretry（失败次数，例：3，留空不改）： " NEW_MAXRETRY
-    read -rp "请输入新的 bantime（封禁时长，例：12h 或 3600，留空不改）： " NEW_BANTIME
-    read -rp "请输入新的 findtime（检测周期秒数，例：21600，留空不改）： " NEW_FINDTIME
+    read -rp "请输入新的 bantime（封禁时长，例：12h / 1d / -1，留空不改）： " NEW_BANTIME
+    read -rp "请输入新的 findtime（检测周期，例：600 / 30m / 1h / 1d，留空不改）： " NEW_FINDTIME
 
     if [[ -z "$NEW_MAXRETRY" && -z "$NEW_BANTIME" && -z "$NEW_FINDTIME" ]]; then
         echo "ℹ️ 未输入任何修改，保持原样。"
@@ -1091,16 +1103,20 @@ modify_ssh_params() {
     fi
 
     if [[ -n "$NEW_BANTIME" ]]; then
-        FINAL_BANTIME="$NEW_BANTIME"
-        echo "✅ bantime 将修改为：$FINAL_BANTIME"
+        if ! is_valid_bantime "$NEW_BANTIME"; then
+            echo "⚠ bantime 格式无效，支持：600 / 12h / 1d / 1w / -1，已忽略该项修改。"
+        else
+            FINAL_BANTIME="$NEW_BANTIME"
+            echo "✅ bantime 将修改为：$FINAL_BANTIME"
+        fi
     fi
 
     if [[ -n "$NEW_FINDTIME" ]]; then
-        if ! [[ "$NEW_FINDTIME" =~ ^[0-9]+$ ]]; then
-            echo "⚠ findtime 必须是整数秒数，已忽略该项修改。"
+        if ! is_valid_findtime "$NEW_FINDTIME"; then
+            echo "⚠ findtime 格式无效，支持：600 / 30m / 1h / 1d / 1w，已忽略该项修改。"
         else
             FINAL_FINDTIME="$NEW_FINDTIME"
-            echo "✅ findtime 将修改为：$FINAL_FINDTIME 秒"
+            echo "✅ findtime 将修改为：$FINAL_FINDTIME"
         fi
     fi
 
@@ -1159,7 +1175,7 @@ enable_3xui_tls_protection() {
     fi
 
     echo "✅ 3x-ui TLS 扫描封禁已启用。"
-    echo "   当前策略：${CUR_FINDTIME} 秒内达到 ${CUR_MAXRETRY} 次 TLS 握手异常，则封禁 ${CUR_BANTIME}。"
+    echo "   当前策略：${CUR_FINDTIME} 内达到 ${CUR_MAXRETRY} 次 TLS 握手异常，则封禁 ${CUR_BANTIME}。"
     show_jail_simple_status "3xui-tls"
     pause
 }
@@ -1191,15 +1207,18 @@ modify_3xui_tls_params() {
     echo "  port（记录端口）       : $CURRENT_PORT"
     echo "  maxretry（失败次数）   : $CURRENT_MAXRETRY"
     echo "  bantime（封禁时长）    : $CURRENT_BANTIME"
-    echo "  findtime（检测周期 秒）: $CURRENT_FINDTIME"
+    echo "  findtime（检测周期）   : $CURRENT_FINDTIME"
     echo "-------------------------------------------------------------"
     echo "留空则表示不修改该项。"
+    echo "bantime 支持：600 / 12h / 1d / 1w / -1（永久封禁）"
+    echo "findtime 支持：600 / 30m / 1h / 1d / 1w"
+    echo "============================================================="
     echo ""
 
     read -rp "请输入新的记录端口（例：744，留空不改）： " NEW_PORT
     read -rp "请输入新的 maxretry（失败次数，例：8，留空不改）： " NEW_MAXRETRY
-    read -rp "请输入新的 bantime（封禁时长，例：6h 或 3600，留空不改）： " NEW_BANTIME
-    read -rp "请输入新的 findtime（检测周期秒数，例：300，留空不改）： " NEW_FINDTIME
+    read -rp "请输入新的 bantime（封禁时长，例：12h / 1d / -1，留空不改）： " NEW_BANTIME
+    read -rp "请输入新的 findtime（检测周期，例：600 / 30m / 1h / 1d，留空不改）： " NEW_FINDTIME
 
     if [[ -z "$NEW_PORT" && -z "$NEW_MAXRETRY" && -z "$NEW_BANTIME" && -z "$NEW_FINDTIME" ]]; then
         echo "ℹ️ 未输入任何修改，保持原样。"
@@ -1232,16 +1251,20 @@ modify_3xui_tls_params() {
     fi
 
     if [[ -n "$NEW_BANTIME" ]]; then
-        FINAL_BANTIME="$NEW_BANTIME"
-        echo "✅ bantime 将修改为：$FINAL_BANTIME"
+        if ! is_valid_bantime "$NEW_BANTIME"; then
+            echo "⚠ bantime 格式无效，支持：600 / 12h / 1d / 1w / -1，已忽略该项修改。"
+        else
+            FINAL_BANTIME="$NEW_BANTIME"
+            echo "✅ bantime 将修改为：$FINAL_BANTIME"
+        fi
     fi
 
     if [[ -n "$NEW_FINDTIME" ]]; then
-        if ! [[ "$NEW_FINDTIME" =~ ^[0-9]+$ ]]; then
-            echo "⚠ findtime 必须是整数秒数，已忽略该项修改。"
+        if ! is_valid_findtime "$NEW_FINDTIME"; then
+            echo "⚠ findtime 格式无效，支持：600 / 30m / 1h / 1d / 1w，已忽略该项修改。"
         else
             FINAL_FINDTIME="$NEW_FINDTIME"
-            echo "✅ findtime 将修改为：$FINAL_FINDTIME 秒"
+            echo "✅ findtime 将修改为：$FINAL_FINDTIME"
         fi
     fi
 
@@ -1308,7 +1331,7 @@ enable_3xui_login_protection() {
     fi
 
     echo "✅ 3x-ui 登录失败封禁已启用。"
-    echo "   当前策略：${CUR_FINDTIME} 秒内达到 ${CUR_MAXRETRY} 次错误登录，则封禁 ${CUR_BANTIME}。"
+    echo "   当前策略：${CUR_FINDTIME} 内达到 ${CUR_MAXRETRY} 次错误登录，则封禁 ${CUR_BANTIME}。"
     echo "⚠ 注意：请确认 3x-ui 失败登录日志里的 IP 是真实来访 IP。"
     show_jail_simple_status "3xui-login"
     pause
@@ -1341,15 +1364,18 @@ modify_3xui_login_params() {
     echo "  port（记录端口）       : $CURRENT_PORT"
     echo "  maxretry（失败次数）   : $CURRENT_MAXRETRY"
     echo "  bantime（封禁时长）    : $CURRENT_BANTIME"
-    echo "  findtime（检测周期 秒）: $CURRENT_FINDTIME"
+    echo "  findtime（检测周期）   : $CURRENT_FINDTIME"
     echo "-------------------------------------------------------------"
     echo "留空则表示不修改该项。"
+    echo "bantime 支持：600 / 12h / 1d / 1w / -1（永久封禁）"
+    echo "findtime 支持：600 / 30m / 1h / 1d / 1w"
+    echo "============================================================="
     echo ""
 
     read -rp "请输入新的记录端口（例：744，留空不改）： " NEW_PORT
     read -rp "请输入新的 maxretry（失败次数，例：5，留空不改）： " NEW_MAXRETRY
-    read -rp "请输入新的 bantime（封禁时长，例：12h 或 3600，留空不改）： " NEW_BANTIME
-    read -rp "请输入新的 findtime（检测周期秒数，例：600，留空不改）： " NEW_FINDTIME
+    read -rp "请输入新的 bantime（封禁时长，例：12h / 1d / -1，留空不改）： " NEW_BANTIME
+    read -rp "请输入新的 findtime（检测周期，例：600 / 30m / 1h / 1d，留空不改）： " NEW_FINDTIME
 
     if [[ -z "$NEW_PORT" && -z "$NEW_MAXRETRY" && -z "$NEW_BANTIME" && -z "$NEW_FINDTIME" ]]; then
         echo "ℹ️ 未输入任何修改，保持原样。"
@@ -1382,16 +1408,20 @@ modify_3xui_login_params() {
     fi
 
     if [[ -n "$NEW_BANTIME" ]]; then
-        FINAL_BANTIME="$NEW_BANTIME"
-        echo "✅ bantime 将修改为：$FINAL_BANTIME"
+        if ! is_valid_bantime "$NEW_BANTIME"; then
+            echo "⚠ bantime 格式无效，支持：600 / 12h / 1d / 1w / -1，已忽略该项修改。"
+        else
+            FINAL_BANTIME="$NEW_BANTIME"
+            echo "✅ bantime 将修改为：$FINAL_BANTIME"
+        fi
     fi
 
     if [[ -n "$NEW_FINDTIME" ]]; then
-        if ! [[ "$NEW_FINDTIME" =~ ^[0-9]+$ ]]; then
-            echo "⚠ findtime 必须是整数秒数，已忽略该项修改。"
+        if ! is_valid_findtime "$NEW_FINDTIME"; then
+            echo "⚠ findtime 格式无效，支持：600 / 30m / 1h / 1d / 1w，已忽略该项修改。"
         else
             FINAL_FINDTIME="$NEW_FINDTIME"
-            echo "✅ findtime 将修改为：$FINAL_FINDTIME 秒"
+            echo "✅ findtime 将修改为：$FINAL_FINDTIME"
         fi
     fi
 
