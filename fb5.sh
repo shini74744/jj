@@ -288,14 +288,17 @@ get_xui_allhost_action() {
 }
 
 pick_ssh_logpath() {
-    local paths=()
-    [[ -f /var/log/auth.log ]] && paths+=("/var/log/auth.log")
-    [[ -f /var/log/secure ]] && paths+=("/var/log/secure")
-    if (( ${#paths[@]} == 0 )); then
-        echo "/var/log/auth.log /var/log/secure"
+    if [[ -f /var/log/auth.log ]]; then
+        echo "/var/log/auth.log"
         return
     fi
-    echo "${paths[*]}"
+
+    if [[ -f /var/log/secure ]]; then
+        echo "/var/log/secure"
+        return
+    fi
+
+    echo ""
 }
 
 prompt_ssh_port() {
@@ -1111,6 +1114,14 @@ EOF
 
     local LOGPATH
     LOGPATH="$(pick_ssh_logpath)"
+
+    if [[ -z "$LOGPATH" ]]; then
+    echo "⚠ 未找到 /var/log/auth.log 或 /var/log/secure"
+    echo "   当前机器将不自动重写 [sshd] 的 logpath，请手动改用 systemd backend。"
+    echo "   否则可能导致 Fail2ban 其余 jail 一起加载失败。"
+    pause
+    return
+    fi
 
     echo "🛡 写入/更新 SSH 防爆破配置到 jail.local（端口: $SSH_PORT）..."
     rewrite_or_append_sshd_block "$SSH_PORT" "$ACTION" "$LOGPATH" "$CUR_MAXRETRY" "$CUR_FINDTIME" "$CUR_BANTIME"
