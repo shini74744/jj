@@ -1224,7 +1224,21 @@ modify_ssh_params() {
     local ACTION LOGPATH
     ACTION="$(get_ssh_action_for_firewall)"
     LOGPATH="$(get_sshd_value logpath)"
+
+    # 旧版脚本可能把两个日志路径写成一行，Fail2ban 会报错，这里直接纠正
+    if [[ "$LOGPATH" == *" "* ]]; then
+        LOGPATH=""
+    fi
+
     [[ -z "$LOGPATH" ]] && LOGPATH="$(pick_ssh_logpath)"
+
+    if [[ -z "$LOGPATH" ]]; then
+        echo "⚠ 未找到 /var/log/auth.log 或 /var/log/secure"
+        echo "   当前机器将不自动重写 [sshd] 的 logpath，请手动改用 systemd backend。"
+        echo "   否则可能导致 Fail2ban 其余 jail 一起加载失败。"
+        pause
+        return
+    fi
 
     echo "🛠 更新 [sshd] 段..."
     rewrite_or_append_sshd_block "$CURRENT_PORT" "$ACTION" "$LOGPATH" "$FINAL_MAXRETRY" "$FINAL_FINDTIME" "$FINAL_BANTIME"
