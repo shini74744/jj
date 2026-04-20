@@ -100,10 +100,13 @@ detect_os() {
 detect_firewall() {
     if [[ -n "$FIREWALL" ]]; then return; fi
 
-    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-        FIREWALL="firewalld"
-    elif command -v nft &>/dev/null; then
+    # 优先使用 nftables；没有 nft 再用 iptables
+    if command -v nft &>/dev/null; then
         FIREWALL="nftables"
+    elif command -v iptables &>/dev/null; then
+        FIREWALL="iptables"
+    elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        FIREWALL="firewalld"
     else
         FIREWALL="iptables"
     fi
@@ -267,12 +270,15 @@ get_ssh_action_for_firewall() {
     esac
 }
 
-# 3x-ui 整机拦：当前只针对 nftables 做可靠实现
+# 3x-ui 整机拦：同时支持 nftables 和 iptables
 get_xui_allhost_action() {
     detect_firewall
     case "$FIREWALL" in
         nftables)
             echo "xui-nftables-all"
+            ;;
+        iptables)
+            echo "iptables[type=allports, protocol=all]"
             ;;
         *)
             echo ""
@@ -631,15 +637,19 @@ ensure_xui_fail2ban_env() {
     fi
 
     detect_firewall
-    if [[ "$FIREWALL" != "nftables" ]]; then
-        echo "❌ 当前检测到的防火墙不是 nftables。"
-        echo "   这版 3x-ui『被 ban 后整机拦』功能只针对 nftables 做了可靠实现。"
+
+    if [[ "$FIREWALL" != "nftables" && "$FIREWALL" != "iptables" ]]; then
+        echo "❌ 当前未检测到可用的 nftables 或 iptables。"
+        echo "   3x-ui『被 ban 后整机拦』功能目前只支持 nftables / iptables。"
         return 1
     fi
 
     mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d /etc/fail2ban/action.d
 
-    write_xui_nft_all_action_file
+    # 只有 nftables 环境才需要自定义 action 文件
+    if [[ "$FIREWALL" == "nftables" ]]; then
+        write_xui_nft_all_action_file
+    fi
 
     if ! systemctl status x-ui >/dev/null 2>&1; then
         echo "⚠ 未检测到 x-ui 服务正在运行，仍会写入规则，但请确认服务名确实是 x-ui。"
@@ -985,8 +995,8 @@ print_status_summary() {
     echo "开机启动: $fb_enabled"
     echo "SSH 防爆破 (sshd): $sshd_jail"
     echo "SSH 端口(记录于 fail2ban): $show_port"
-    echo "3x-ui TLS 扫描封禁: $xui_tls_jail (记录端口: $xui_tls_port, 被 ban 后整机拦)"
-    echo "3x-ui 登录失败封禁: $xui_login_jail (记录端口: $xui_login_port, 被 ban 后整机拦)"
+    echo "3x-ui TLS 扫描封禁: $xui_tls_jail (记录端口: $xui_tls_port, 被 ban 后整机拦, 防火墙: $FIREWALL)"
+    echo "3x-ui 登录失败封禁: $xui_login_jail (记录端口: $xui_login_port, 被 ban 后整机拦, 防火墙: $FIREWALL)"
     echo "快捷命令: $fb5_status"
     echo "------------------------------------------------"
     echo ""
