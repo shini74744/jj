@@ -672,6 +672,44 @@ show_jail_simple_status() {
     return 1
 }
 
+remove_sshd_block_only() {
+    if [[ ! -f "$JAIL" ]]; then
+        echo "ℹ️ 未检测到 $JAIL，跳过 SSH 配置删除。"
+        return 0
+    fi
+
+    if ! grep -q "^\[sshd\]" "$JAIL"; then
+        echo "ℹ️ 未检测到 [sshd] 段，跳过 SSH 配置删除。"
+        return 0
+    fi
+
+    local tmpfile
+    tmpfile="$(mktemp)"
+
+    awk '
+        BEGIN{in_sshd=0}
+        /^\[sshd\]$/ {in_sshd=1; next}
+        /^\[.*\]$/ {
+            if(in_sshd){in_sshd=0}
+        }
+        !in_sshd {print}
+    ' "$JAIL" > "$tmpfile" && mv "$tmpfile" "$JAIL"
+
+    echo "✅ 已删除 jail.local 中的 [sshd] 配置段。"
+
+    if ! grep -q '[^[:space:]]' "$JAIL" 2>/dev/null; then
+        rm -f "$JAIL"
+        echo "ℹ️ jail.local 已空，已自动删除。"
+    fi
+}
+
+restart_fail2ban_if_present() {
+    if command -v systemctl &>/dev/null && command -v fail2ban-client &>/dev/null; then
+        systemctl restart fail2ban 2>/dev/null || true
+        systemctl enable fail2ban >/dev/null 2>&1 || true
+    fi
+}
+
 #-----------------------------
 # 通用：查看 / 解禁指定 jail 的 IP
 #-----------------------------
@@ -1456,59 +1494,189 @@ unban_3xui_login_ip() {
 # 3. 卸载本脚本相关配置
 #-----------------------------
 uninstall_all() {
-    echo "⚠ 此操作将删除："
-    echo "   - /etc/fail2ban/jail.local"
-    echo "   - $XUI_TLS_FILTER"
-    echo "   - $XUI_TLS_JAIL"
-    echo "   - $XUI_LOGIN_FILTER"
-    echo "   - $XUI_LOGIN_JAIL"
-    echo "   - $XUI_NFT_ALL_ACTION"
-    echo ""
+    while true; do
+        clear
+        echo "================ 卸载菜单 ================"
+        echo "你可以按需删除配置，而不是一次性全删。"
+        echo ""
+        echo " 1) 卸载全部配置（SSH + 3x-ui TLS + 3x-ui 登录失败 + 自定义 action）"
+        echo " 2) 仅卸载 SSH 防爆破配置（只删除 jail.local 中的 [sshd] 段）"
+        echo " 3) 仅卸载 3x-ui TLS 扫描封禁配置"
+        echo " 4) 仅卸载 3x-ui 登录失败封禁配置"
+        echo " 5) 仅卸载 3x-ui 自定义 nftables action"
+        echo " 6) 仅删除快捷命令 $INSTALL_CMD_PATH"
+        echo " 7) 卸载 fail2ban 软件包（危险操作）"
+        echo " 0) 返回主菜单"
+        echo "------------------------------------------"
+        read -rp "请输入选项 [0-7]: " UCHOICE
 
-    read -rp "是否同时删除快捷命令 $INSTALL_CMD_PATH ? [y/N]: " RM_CMD
-    case "$RM_CMD" in
-        y|Y) rm -f "$INSTALL_CMD_PATH"; echo "✅ 已删除快捷命令：$INSTALL_CMD_PATH" ;;
-        *)   echo "已保留快捷命令（如存在）。" ;;
-    esac
+        case "$UCHOICE" in
+            1)
+                echo "⚠ 将删除以下配置："
+                echo "   - jail.local 中的 [sshd] 段"
+                echo "   - $XUI_TLS_FILTER"
+                echo "   - $XUI_TLS_JAIL"
+                echo "   - $XUI_LOGIN_FILTER"
+                echo "   - $XUI_LOGIN_JAIL"
+                echo "   - $XUI_NFT_ALL_ACTION"
+                echo ""
+                read -rp "确认继续吗？[y/N]: " CONFIRM
+                case "$CONFIRM" in
+                    y|Y)
+                        remove_sshd_block_only
+                        rm -f "$XUI_TLS_FILTER" "$XUI_TLS_JAIL" "$XUI_LOGIN_FILTER" "$XUI_LOGIN_JAIL" "$XUI_NFT_ALL_ACTION"
+                        echo "✅ 全部脚本相关配置已删除。"
 
-    read -rp "确认继续删除上述 Fail2ban 配置吗？[y/N]: " CONFIRM
-    case "$CONFIRM" in
-        y|Y) ;;
-        *)   echo "已取消卸载配置。"; pause; return ;;
-    esac
+                        read -rp "是否同时删除快捷命令 $INSTALL_CMD_PATH ? [y/N]: " RM_CMD
+                        case "$RM_CMD" in
+                            y|Y)
+                                rm -f "$INSTALL_CMD_PATH"
+                                echo "✅ 已删除快捷命令：$INSTALL_CMD_PATH"
+                                ;;
+                            *)
+                                echo "已保留快捷命令。"
+                                ;;
+                        esac
 
-    rm -f /etc/fail2ban/jail.local
-    rm -f "$XUI_TLS_FILTER" "$XUI_TLS_JAIL" "$XUI_LOGIN_FILTER" "$XUI_LOGIN_JAIL" "$XUI_NFT_ALL_ACTION"
-    echo "✅ 本脚本相关 Fail2ban 配置文件已删除。"
+                        restart_fail2ban_if_present
+                        ;;
+                    *)
+                        echo "已取消。"
+                        ;;
+                esac
+                pause
+                ;;
+            2)
+                echo "⚠ 将仅删除 SSH 防爆破配置（[sshd] 段）。"
+                read -rp "确认继续吗？[y/N]: " CONFIRM
+                case "$CONFIRM" in
+                    y|Y)
+                        remove_sshd_block_only
+                        restart_fail2ban_if_present
+                        ;;
+                    *)
+                        echo "已取消。"
+                        ;;
+                esac
+                pause
+                ;;
+            3)
+                echo "⚠ 将仅删除 3x-ui TLS 扫描封禁配置："
+                echo "   - $XUI_TLS_FILTER"
+                echo "   - $XUI_TLS_JAIL"
+                read -rp "确认继续吗？[y/N]: " CONFIRM
+                case "$CONFIRM" in
+                    y|Y)
+                        rm -f "$XUI_TLS_FILTER" "$XUI_TLS_JAIL"
+                        echo "✅ 已删除 3x-ui TLS 扫描封禁配置。"
+                        restart_fail2ban_if_present
+                        ;;
+                    *)
+                        echo "已取消。"
+                        ;;
+                esac
+                pause
+                ;;
+            4)
+                echo "⚠ 将仅删除 3x-ui 登录失败封禁配置："
+                echo "   - $XUI_LOGIN_FILTER"
+                echo "   - $XUI_LOGIN_JAIL"
+                read -rp "确认继续吗？[y/N]: " CONFIRM
+                case "$CONFIRM" in
+                    y|Y)
+                        rm -f "$XUI_LOGIN_FILTER" "$XUI_LOGIN_JAIL"
+                        echo "✅ 已删除 3x-ui 登录失败封禁配置。"
+                        restart_fail2ban_if_present
+                        ;;
+                    *)
+                        echo "已取消。"
+                        ;;
+                esac
+                pause
+                ;;
+            5)
+                echo "⚠ 将仅删除 3x-ui 自定义 nftables action："
+                echo "   - $XUI_NFT_ALL_ACTION"
+                read -rp "确认继续吗？[y/N]: " CONFIRM
+                case "$CONFIRM" in
+                    y|Y)
+                        rm -f "$XUI_NFT_ALL_ACTION"
+                        echo "✅ 已删除 3x-ui 自定义 nftables action。"
+                        restart_fail2ban_if_present
+                        ;;
+                    *)
+                        echo "已取消。"
+                        ;;
+                esac
+                pause
+                ;;
+            6)
+                if [[ -e "$INSTALL_CMD_PATH" ]]; then
+                    read -rp "确认删除快捷命令 $INSTALL_CMD_PATH ? [y/N]: " CONFIRM
+                    case "$CONFIRM" in
+                        y|Y)
+                            rm -f "$INSTALL_CMD_PATH"
+                            echo "✅ 已删除快捷命令：$INSTALL_CMD_PATH"
+                            ;;
+                        *)
+                            echo "已取消。"
+                            ;;
+                    esac
+                else
+                    echo "ℹ️ 未检测到快捷命令：$INSTALL_CMD_PATH"
+                fi
+                pause
+                ;;
+            7)
+                echo "⚠ 危险操作：将卸载 fail2ban 软件包。"
+                echo "   建议先确认你不再需要任何 fail2ban 防护。"
+                echo ""
+                read -rp "是否先删除本脚本相关配置？[Y/n]: " RM_CFG_FIRST
+                case "$RM_CFG_FIRST" in
+                    n|N)
+                        echo "已选择保留现有配置文件。"
+                        ;;
+                    *)
+                        remove_sshd_block_only
+                        rm -f "$XUI_TLS_FILTER" "$XUI_TLS_JAIL" "$XUI_LOGIN_FILTER" "$XUI_LOGIN_JAIL" "$XUI_NFT_ALL_ACTION"
+                        echo "✅ 已先删除本脚本相关配置。"
+                        ;;
+                esac
 
-    read -rp "是否同时卸载 fail2ban 软件包？[y/N]: " CONFIRM2
-    case "$CONFIRM2" in
-        y|Y)
-            systemctl stop fail2ban 2>/dev/null || true
-            detect_os
-            PM="$(detect_pkg_mgr)"
-            if [[ "$PM" == "apt" ]]; then
-                apt-get purge -y fail2ban || true
-            elif [[ "$PM" == "dnf" ]]; then
-                dnf -y remove fail2ban || true
-            elif [[ "$PM" == "yum" ]]; then
-                yum -y remove fail2ban || true
-            else
-                echo "⚠ 未识别包管理器，跳过卸载软件包。"
-            fi
-            systemctl disable fail2ban 2>/dev/null || true
-            echo "✅ fail2ban 软件包已卸载。"
-            ;;
-        *)
-            if command -v systemctl &>/dev/null; then
-                systemctl restart fail2ban 2>/dev/null || true
-                systemctl enable fail2ban >/dev/null 2>&1 || true
-            fi
-            echo "已保留 fail2ban 软件包（但已删除本脚本配置）。"
-            ;;
-    esac
-
-    pause
+                read -rp "确认继续卸载 fail2ban 软件包吗？[y/N]: " CONFIRM
+                case "$CONFIRM" in
+                    y|Y)
+                        systemctl stop fail2ban 2>/dev/null || true
+                        detect_os
+                        PM="$(detect_pkg_mgr)"
+                        if [[ "$PM" == "apt" ]]; then
+                            apt-get purge -y fail2ban || true
+                        elif [[ "$PM" == "dnf" ]]; then
+                            dnf -y remove fail2ban || true
+                        elif [[ "$PM" == "yum" ]]; then
+                            yum -y remove fail2ban || true
+                        else
+                            echo "⚠ 未识别包管理器，跳过卸载软件包。"
+                        fi
+                        systemctl disable fail2ban 2>/dev/null || true
+                        echo "✅ fail2ban 软件包已卸载。"
+                        ;;
+                    *)
+                        echo "已取消。"
+                        restart_fail2ban_if_present
+                        ;;
+                esac
+                pause
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo "❌ 无效选项。"
+                pause
+                ;;
+        esac
+    done
 }
 
 #-----------------------------
