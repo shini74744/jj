@@ -28,6 +28,7 @@ XUI_LOGIN_FILTER="/etc/fail2ban/filter.d/3xui-login.conf"
 XUI_LOGIN_JAIL="/etc/fail2ban/jail.d/3xui-login.local"
 
 XUI_NFT_ALL_ACTION="/etc/fail2ban/action.d/xui-nftables-all.conf"
+XUI_IPT_ALL_ACTION="/etc/fail2ban/action.d/xui-iptables-all.conf"
 
 #-----------------------------
 # 默认参数（新机器首次安装时使用）
@@ -278,7 +279,7 @@ get_xui_allhost_action() {
             echo "xui-nftables-all"
             ;;
         iptables)
-            echo "iptables[type=allports, protocol=all]"
+            echo "xui-iptables-all"
             ;;
         *)
             echo ""
@@ -579,6 +580,30 @@ EOF
 }
 
 #-----------------------------
+# XUI 自定义 iptables 整机拦 action
+#-----------------------------
+write_xui_iptables_all_action_file() {
+    mkdir -p /etc/fail2ban/action.d
+
+    cat > "$XUI_IPT_ALL_ACTION" <<'EOF'
+[Definition]
+actionstart = iptables -N f2b-<name> 2>/dev/null || true
+              iptables -C INPUT -j f2b-<name> 2>/dev/null || iptables -I INPUT -j f2b-<name>
+              iptables -C f2b-<name> -j RETURN 2>/dev/null || iptables -A f2b-<name> -j RETURN
+
+actionstop = iptables -D INPUT -j f2b-<name> 2>/dev/null || true
+             iptables -F f2b-<name> 2>/dev/null || true
+             iptables -X f2b-<name> 2>/dev/null || true
+
+actioncheck = iptables -n -L INPUT | grep -q "f2b-<name>"
+
+actionban = iptables -I f2b-<name> 1 -s <ip> -j REJECT --reject-with icmp-port-unreachable
+
+actionunban = iptables -D f2b-<name> -s <ip> -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+EOF
+}
+
+#-----------------------------
 # Fail2ban 状态检查
 #-----------------------------
 ensure_fail2ban_ready() {
@@ -646,11 +671,13 @@ ensure_xui_fail2ban_env() {
 
     mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d /etc/fail2ban/action.d
 
-    # 只有 nftables 环境才需要自定义 action 文件
+    # 根据防火墙类型写入对应的自定义 action 文件
     if [[ "$FIREWALL" == "nftables" ]]; then
         write_xui_nft_all_action_file
+    elif [[ "$FIREWALL" == "iptables" ]]; then
+        write_xui_iptables_all_action_file
     fi
-
+    
     if ! systemctl status x-ui >/dev/null 2>&1; then
         echo "⚠ 未检测到 x-ui 服务正在运行，仍会写入规则，但请确认服务名确实是 x-ui。"
         echo "   你可以手动检查：systemctl status x-ui"
