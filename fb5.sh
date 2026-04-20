@@ -301,6 +301,10 @@ pick_ssh_logpath() {
     echo ""
 }
 
+build_sshd_journalmatch() {
+    echo "_SYSTEMD_UNIT=sshd.service + _COMM=sshd"
+}
+
 prompt_ssh_port() {
     local p=""
     while true; do
@@ -381,55 +385,81 @@ get_ini_value_from_file() {
 rewrite_or_append_sshd_block() {
     local port="$1"
     local action="$2"
-    local logpath="$3"
-    local maxretry="$4"
-    local findtime="$5"
-    local bantime="$6"
+    local maxretry="$3"
+    local findtime="$4"
+    local bantime="$5"
+    local backend="$6"       # file / systemd
+    local logpath="$7"       # 仅 file backend 使用
+    local journalmatch="$8"  # 仅 systemd backend 使用
 
     if [[ ! -f "$JAIL" ]]; then
         mkdir -p /etc/fail2ban
         touch "$JAIL"
     fi
 
-    if ! grep -q "^\[sshd\]" "$JAIL"; then
-        cat >> "$JAIL" <<EOF
-
-[sshd]
-enabled  = true
-port     = $port
-filter   = sshd
-action   = $action
-logpath  = $logpath
-maxretry = $maxretry
-findtime = $findtime
-bantime  = $bantime
-EOF
-        return
-    fi
-
     local tmpfile
     tmpfile="$(mktemp)"
-    awk -v port="$port" -v action="$action" -v logpath="$logpath" \
-        -v maxretry="$maxretry" -v findtime="$findtime" -v bantime="$bantime" '
-        BEGIN{in_sshd=0; printed=0}
-        /^\[sshd\]/{
-            if(!printed){
-                print "[sshd]"
-                print "enabled  = true"
-                print "port     = " port
-                print "filter   = sshd"
-                print "action   = " action
+
+    awk \
+        -v port="$port" \
+        -v action="$action" \
+        -v maxretry="$maxretry" \
+        -v findtime="$findtime" \
+        -v bantime="$bantime" \
+        -v backend="$backend" \
+        -v logpath="$logpath" \
+        -v journalmatch="$journalmatch" '
+        function print_sshd_block() {
+            print "[sshd]"
+            print "enabled  = true"
+            print "port     = " port
+            print "filter   = sshd"
+
+            if (backend == "systemd") {
+                print "backend  = systemd"
+                print "journalmatch = " journalmatch
+            } else {
                 print "logpath  = " logpath
-                print "maxretry = " maxretry
-                print "findtime = " findtime
-                print "bantime  = " bantime
+            }
+
+            print "action   = " action
+            print "maxretry = " maxretry
+            print "findtime = " findtime
+            print "bantime  = " bantime
+        }
+
+        BEGIN {
+            in_sshd=0
+            printed=0
+        }
+
+        /^\[sshd\]$/ {
+            if (!printed) {
+                print_sshd_block()
                 printed=1
             }
             in_sshd=1
             next
         }
-        /^\[.*\]/{ in_sshd=0 }
-        { if(!in_sshd) print }
+
+        /^\[.*\]$/ {
+            if (in_sshd) {
+                in_sshd=0
+            }
+            print
+            next
+        }
+
+        {
+            if (!in_sshd) print
+        }
+
+        END {
+            if (!printed) {
+                print ""
+                print_sshd_block()
+            }
+        }
     ' "$JAIL" > "$tmpfile" && mv "$tmpfile" "$JAIL"
 }
 
@@ -1112,19 +1142,30 @@ EOF
     CUR_FINDTIME="$(get_sshd_value findtime)"; [[ -z "$CUR_FINDTIME" ]] && CUR_FINDTIME="$SSH_DEFAULT_FINDTIME"
     CUR_BANTIME="$(get_sshd_value bantime)";  [[ -z "$CUR_BANTIME"  ]] && CUR_BANTIME="$SSH_DEFAULT_BANTIME"
 
-    local LOGPATH
-    LOGPATH="$(pick_ssh_logpath)"
+    local SSH_BACKEND SSH_LOGPATH SSH_JOURNALMATCH
+    SSH_LOGPATH="$(pick_ssh_logpath)"
 
-    if [[ -z "$LOGPATH" ]]; then
-    echo "⚠ 未找到 /var/log/auth.log 或 /var/log/secure"
-    echo "   当前机器将不自动重写 [sshd] 的 logpath，请手动改用 systemd backend。"
-    echo "   否则可能导致 Fail2ban 其余 jail 一起加载失败。"
-    pause
-    return
+    if [[ -n "$SSH_LOGPATH" ]]; then
+        SSH_BACKEND="file"
+        SSH_JOURNALMATCH=""
+        echo "ℹ️ SSH 将使用日志文件：$SSH_LOGPATH"
+    else
+        SSH_BACKEND="systemd"
+        SSH_LOGPATH=""
+        SSH_JOURNALMATCH="$(build_sshd_journalmatch)"
+        echo "ℹ️ 未找到 /var/log/auth.log 或 /var/log/secure，SSH 将改用 systemd backend"
     fi
 
     echo "🛡 写入/更新 SSH 防爆破配置到 jail.local（端口: $SSH_PORT）..."
-    rewrite_or_append_sshd_block "$SSH_PORT" "$ACTION" "$LOGPATH" "$CUR_MAXRETRY" "$CUR_FINDTIME" "$CUR_BANTIME"
+    rewrite_or_append_sshd_block \
+        "$SSH_PORT" \
+        "$ACTION" \
+        "$CUR_MAXRETRY" \
+        "$CUR_FINDTIME" \
+        "$CUR_BANTIME" \
+        "$SSH_BACKEND" \
+        "$SSH_LOGPATH" \
+        "$SSH_JOURNALMATCH"
 
     if ! restart_fail2ban_or_return; then
         return
@@ -1221,27 +1262,41 @@ modify_ssh_params() {
         fi
     fi
 
-    local ACTION LOGPATH
+    local ACTION SSH_BACKEND SSH_LOGPATH SSH_JOURNALMATCH
     ACTION="$(get_ssh_action_for_firewall)"
-    LOGPATH="$(get_sshd_value logpath)"
+
+    SSH_LOGPATH="$(get_sshd_value logpath)"
 
     # 旧版脚本可能把两个日志路径写成一行，Fail2ban 会报错，这里直接纠正
-    if [[ "$LOGPATH" == *" "* ]]; then
-        LOGPATH=""
+    if [[ "$SSH_LOGPATH" == *" "* ]]; then
+        SSH_LOGPATH=""
     fi
 
-    [[ -z "$LOGPATH" ]] && LOGPATH="$(pick_ssh_logpath)"
-
-    if [[ -z "$LOGPATH" ]]; then
-        echo "⚠ 未找到 /var/log/auth.log 或 /var/log/secure"
-        echo "   当前机器将不自动重写 [sshd] 的 logpath，请手动改用 systemd backend。"
-        echo "   否则可能导致 Fail2ban 其余 jail 一起加载失败。"
-        pause
-        return
+    if [[ -n "$SSH_LOGPATH" ]]; then
+        SSH_BACKEND="file"
+        SSH_JOURNALMATCH=""
+    else
+        SSH_LOGPATH="$(pick_ssh_logpath)"
+        if [[ -n "$SSH_LOGPATH" ]]; then
+            SSH_BACKEND="file"
+            SSH_JOURNALMATCH=""
+        else
+            SSH_BACKEND="systemd"
+            SSH_LOGPATH=""
+            SSH_JOURNALMATCH="$(build_sshd_journalmatch)"
+        fi
     fi
 
     echo "🛠 更新 [sshd] 段..."
-    rewrite_or_append_sshd_block "$CURRENT_PORT" "$ACTION" "$LOGPATH" "$FINAL_MAXRETRY" "$FINAL_FINDTIME" "$FINAL_BANTIME"
+    rewrite_or_append_sshd_block \
+        "$CURRENT_PORT" \
+        "$ACTION" \
+        "$FINAL_MAXRETRY" \
+        "$FINAL_FINDTIME" \
+        "$FINAL_BANTIME" \
+        "$SSH_BACKEND" \
+        "$SSH_LOGPATH" \
+        "$SSH_JOURNALMATCH"
 
     if ! restart_fail2ban_or_return; then
         return
