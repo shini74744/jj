@@ -4,7 +4,6 @@ SWAPFILE="/swapfile"
 SYSCTL_FILE="/etc/sysctl.d/99-swappiness.conf"
 FSTAB_FILE="/etc/fstab"
 
-# 使用 root 或 sudo 执行命令
 run_priv() {
     if [[ "$(id -u)" -eq 0 ]]; then
         "$@"
@@ -13,7 +12,6 @@ run_priv() {
     fi
 }
 
-# 检查 sudo 权限
 check_privilege() {
     if [[ "$(id -u)" -ne 0 ]]; then
         sudo -v || {
@@ -23,19 +21,20 @@ check_privilege() {
     fi
 }
 
-# 判断指定swap是否正在启用
 is_swap_active() {
     local target="$1"
     swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$target"
 }
 
-# 获取swap类型：file / partition 等
 get_swap_type() {
     local target="$1"
     swapon --show=NAME,TYPE --noheadings 2>/dev/null | awk -v target="$target" '$1 == target {print $2; exit}'
 }
 
-# 从 /etc/fstab 删除指定swap条目
+get_first_active_swap_file() {
+    swapon --show=NAME,TYPE --noheadings 2>/dev/null | awk '$2 == "file" {print $1; exit}'
+}
+
 remove_fstab_swap_entry() {
     local target="$1"
 
@@ -64,7 +63,6 @@ remove_fstab_swap_entry() {
     echo "fstab备份文件：$backup"
 }
 
-# 查看当前swap使用情况
 check_swap() {
     echo -e "\n当前系统内存和swap使用情况:"
     free -h
@@ -88,7 +86,6 @@ check_swap() {
     echo "--------------------------"
 }
 
-# 使用 dd 创建swap文件
 create_swap_with_dd() {
     local swap_size="$1"
     local num unit count_mb
@@ -106,7 +103,6 @@ create_swap_with_dd() {
     run_priv dd if=/dev/zero of="$SWAPFILE" bs=1M count="$count_mb" status=progress
 }
 
-# 创建并启用swap文件
 create_swap() {
     local swap_size="$1"
     local created_by="fallocate"
@@ -124,7 +120,7 @@ create_swap() {
 
     if [[ -e "$SWAPFILE" ]]; then
         echo "错误：$SWAPFILE 已存在。"
-        echo "请先通过菜单删除旧swap文件，或手动处理后再创建。"
+        echo "请先删除旧swap文件，或手动处理后再创建。"
         return 1
     fi
 
@@ -191,7 +187,6 @@ create_swap() {
     echo "--------------------------"
 }
 
-# 设置swappiness值
 set_swappiness() {
     local swappiness_value="$1"
 
@@ -222,15 +217,34 @@ set_swappiness() {
     echo "--------------------------"
 }
 
-# 禁用指定swap文件，但不删除文件
 disable_swap_file() {
     local target
+    local detected_swap
 
-    read -r -p "请输入要禁用的swap文件路径，默认 $SWAPFILE: " target
-    target="${target:-$SWAPFILE}"
+    echo -e "\n当前启用的swap:"
+    if swapon --show | grep -q .; then
+        swapon --show
+    else
+        echo "当前没有启用的swap。"
+    fi
+
+    detected_swap="$(get_first_active_swap_file)"
+
+    if [[ -n "$detected_swap" ]]; then
+        read -r -p "请输入要禁用的swap文件路径，默认 $detected_swap: " target
+        target="${target:-$detected_swap}"
+    else
+        read -r -p "请输入要禁用的swap文件路径，默认 $SWAPFILE: " target
+        target="${target:-$SWAPFILE}"
+    fi
 
     if [[ -z "$target" ]]; then
         echo "路径不能为空。"
+        return 1
+    fi
+
+    if [[ "$target" != /* ]]; then
+        echo "请输入绝对路径，例如 /swapfile 或 /swap.img。"
         return 1
     fi
 
@@ -250,6 +264,7 @@ disable_swap_file() {
 
     if ! run_priv swapoff "$target"; then
         echo "错误：禁用 $target 失败。"
+        echo "可能是当前内存不足，无法把swap中的内容迁回内存。"
         return 1
     fi
 
@@ -260,9 +275,9 @@ disable_swap_file() {
     echo "--------------------------"
 }
 
-# 删除现有swap文件
 delete_existing_swap_file() {
     local target
+    local detected_swap
 
     echo -e "\n当前启用的swap:"
     if swapon --show | grep -q .; then
@@ -271,9 +286,15 @@ delete_existing_swap_file() {
         echo "当前没有启用的swap。"
     fi
 
-    echo
-    read -r -p "请输入要删除的swap文件路径，默认 $SWAPFILE: " target
-    target="${target:-$SWAPFILE}"
+    detected_swap="$(get_first_active_swap_file)"
+
+    if [[ -n "$detected_swap" ]]; then
+        read -r -p "请输入要删除的swap文件路径，默认 $detected_swap: " target
+        target="${target:-$detected_swap}"
+    else
+        read -r -p "请输入要删除的swap文件路径，默认 $SWAPFILE: " target
+        target="${target:-$SWAPFILE}"
+    fi
 
     if [[ -z "$target" ]]; then
         echo "路径不能为空。"
@@ -281,7 +302,7 @@ delete_existing_swap_file() {
     fi
 
     if [[ "$target" != /* ]]; then
-        echo "请输入绝对路径，例如 /swapfile。"
+        echo "请输入绝对路径，例如 /swapfile 或 /swap.img。"
         return 1
     fi
 
@@ -299,6 +320,7 @@ delete_existing_swap_file() {
 
         if ! run_priv swapoff "$target"; then
             echo "错误：swapoff $target 失败。"
+            echo "可能是当前内存不足，无法把swap中的内容迁回内存。"
             return 1
         fi
     else
@@ -329,7 +351,6 @@ delete_existing_swap_file() {
     echo "--------------------------"
 }
 
-# 主菜单
 show_menu() {
     echo -e "\n请选择操作:"
     echo "1. 查看当前swap使用情况"
@@ -340,7 +361,6 @@ show_menu() {
     echo "6. 退出"
 }
 
-# 主逻辑
 check_privilege
 
 while true; do
