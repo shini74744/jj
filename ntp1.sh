@@ -7,8 +7,9 @@
 
 set -Eeuo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 SELF_PATH="/usr/local/sbin/time-sync-manager"
+SOURCE_URL="https://raw.githubusercontent.com/shini74744/jj/refs/heads/main/ntp.sh"
 CONFIG_FILE="/etc/time-sync-manager.conf"
 SERVICE_FILE="/etc/systemd/system/time-sync-manager.service"
 TIMER_FILE="/etc/systemd/system/time-sync-manager.timer"
@@ -135,15 +136,40 @@ PY
 }
 
 source_script_path() {
-    local source_path
+    local source_path temp_source
     source_path=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)
-    if [[ -z "$source_path" || ! -f "$source_path" ||
-          "$source_path" == */bash || "$source_path" == /dev/fd/* ||
-          "$source_path" == /proc/self/fd/* || "$source_path" == /proc/[0-9]*/fd/* ]]; then
-        err "无法从管道安全安装，请先下载脚本再运行"
+
+    if [[ -n "$source_path" && -f "$source_path" &&
+          "$source_path" != */bash && "$source_path" != /dev/fd/* &&
+          "$source_path" != /proc/self/fd/* && "$source_path" != /proc/[0-9]*/fd/* ]]; then
+        printf '%s\n' "$source_path"
+        return 0
+    fi
+
+    # bash <(curl ...) and curl ... | bash have no durable source file.
+    # Fetch the canonical GitHub Raw copy again, then verify syntax and identity.
+    info "检测到管道/进程替换运行，正在从官方 Raw 地址获取可安装副本……" >&2
+    temp_source=$(mktemp /tmp/time-sync-manager.download.XXXXXX)
+    if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 30 "$SOURCE_URL" -o "$temp_source"; then
+        rm -f "$temp_source"
+        err "从 GitHub 下载安装副本失败：$SOURCE_URL"
         return 1
     fi
-    printf '%s\n' "$source_path"
+
+    if ! bash -n "$temp_source"; then
+        rm -f "$temp_source"
+        err "下载的脚本未通过 Bash 语法检查，拒绝安装"
+        return 1
+    fi
+    if ! grep -q '^# Time Sync Manager$' "$temp_source" ||
+       ! grep -q '^SELF_PATH="/usr/local/sbin/time-sync-manager"$' "$temp_source"; then
+        rm -f "$temp_source"
+        err "下载内容不是预期的时间同步管理器，拒绝安装"
+        return 1
+    fi
+
+    chmod 0600 "$temp_source"
+    printf '%s\n' "$temp_source"
 }
 
 timezone_tools_ready() {
@@ -628,8 +654,7 @@ install_manager() {
     check_supported_system
 
     local timezone source_path query=${1:-}
-    # 在 apt、时区和 systemd 变更之前确认安装源是本地真实文件，
-    # 并拒绝自动替换用户已有的 chrony/ntpd。
+    # Before apt/timezone/systemd mutations, resolve a durable source copy.
     source_path=$(source_script_path) || return 1
     check_time_daemon_conflicts
     install_dependencies
@@ -649,6 +674,9 @@ install_manager() {
         install -m 0755 "$source_path" "$SELF_PATH"
     else
         chmod 0755 "$SELF_PATH"
+    fi
+    if [[ "$source_path" == /tmp/time-sync-manager.download.* && "$source_path" != "${BASH_SOURCE[0]}" ]]; then
+        rm -f "$source_path"
     fi
     write_units
     systemctl daemon-reload
@@ -732,13 +760,13 @@ print_help() {
 Time Sync Manager v${VERSION}（Ubuntu / Debian）
 
 用法：
-  bash time-sync-manager.sh                 打开交互菜单
+  bash time-sync-manager.sh                  打开交互菜单
   bash time-sync-manager.sh --install [地区] 安装，可传 香港/hk/JP/France/Asia/Taipei
-  ${SELF_PATH} --sync                       立即同步
-  ${SELF_PATH} --timezone [地区]             修改时区
-  ${SELF_PATH} --status                     查看状态
-  ${SELF_PATH} --logs                       查看日志
-  ${SELF_PATH} --uninstall                  卸载定时任务
+  ${SELF_PATH} --sync                        立即同步
+  ${SELF_PATH} --timezone [地区]              修改时区
+  ${SELF_PATH} --status                      查看状态
+  ${SELF_PATH} --logs                        查看日志
+  ${SELF_PATH} --uninstall                   卸载定时任务
 EOF_HELP
 }
 
