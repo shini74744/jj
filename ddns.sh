@@ -1,6 +1,6 @@
 #!/bin/sh
-# Cloudflare 多域名 DDNS 管理器 2.0.1
-# 用法：以 root 执行 sh cloudflare-ddns-multi.sh；安装后执行 cloudflare-ddns。
+# Cloudflare 多域名 DDNS 管理器 2.0.2
+# 用法：支持本地文件或 bash <(curl -fsSL GitHub原始链接)；安装后执行 cloudflare-ddns。
 # 保留 IPv4/A 记录模式；所有启用的域名同步为本机同一个直连出口 IPv4。
 # 支持 systemd / OpenRC；不修改系统 DNS、路由、时区及宿主机设置。
 # 配置包含 API Token，请勿公开 /etc/cloudflare-ddns/config.json 及其备份。
@@ -13,7 +13,14 @@ export PATH
 LC_ALL=C
 export LC_ALL
 
-VERSION='2.0.1'
+VERSION='2.0.2'
+# GitHub 进程替换/管道入口需要重新下载为普通文件；迁移仓库时修改此地址。
+# 仅启动安装/菜单入口时使用；安装后的定时同步不会从 GitHub 下载或自动升级。
+SCRIPT_URL='https://raw.githubusercontent.com/shini74744/jj/refs/heads/main/ddns.sh'
+INSTALL_SOURCE=''
+SOURCE_KIND='file'
+BOOT_DIR=''
+BOOT_CHILD=''
 CONFIG_DIR='/etc/cloudflare-ddns'
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LEGACY_CONFIG='/etc/cloudflare-ddns.env'
@@ -46,6 +53,82 @@ say() { printf '%s\n' "$*"; }
 err() { printf '错误：%s\n' "$*" >&2; }
 pause() { printf '按回车返回菜单...'; IFS= read -r _pause || :; }
 ask() { printf '%s' "$1"; IFS= read -r REPLY; }
+
+# ---------- GitHub 一键入口：先落盘、校验，再运行；绝不从已读过的管道复制自身 ----------
+valid_script_source() {
+    [ -f "$1" ] && [ -s "$1" ] && [ -r "$1" ] || return 1
+    [ "$(head -n 1 "$1")" = '#!/bin/sh' ] || return 1
+    grep -Fqx "VERSION='$VERSION'" "$1" || return 1
+    [ "$(tail -n 1 "$1")" = "# CF_DDNS_SOURCE_END $VERSION" ] || return 1
+    /bin/sh -n "$1" || return 1
+}
+bootstrap_cleanup() {
+    if [ -n "$BOOT_CHILD" ]; then
+        kill -TERM "$BOOT_CHILD" 2>/dev/null || :
+        wait "$BOOT_CHILD" 2>/dev/null || :
+        BOOT_CHILD=''
+    fi
+    case "$BOOT_DIR" in /tmp/cloudflare-ddns-bootstrap.*) rm -rf -- "$BOOT_DIR" ;; esac
+}
+bootstrap_stream() {
+    # curl | sh 的标准输入是脚本正文，不能继续用来读菜单；交互菜单改读终端。
+    BOOT_USE_TTY=false
+    if [ "$SOURCE_KIND" = stdin ]; then
+        case "${1:---menu}" in
+            --menu)
+                if ! ( : < /dev/tty ) 2>/dev/null; then
+                    err '管道入口没有可用终端；请下载成文件后运行，或使用 bash <(curl -fsSL URL)。'
+                    return 1
+                fi
+                BOOT_USE_TTY=true
+                ;;
+        esac
+    fi
+    command -v curl >/dev/null 2>&1 || { err '一键入口需要 curl；请先安装 curl，或下载脚本后执行。'; return 1; }
+    BOOT_DIR=$(mktemp -d /tmp/cloudflare-ddns-bootstrap.XXXXXXXX) || return 1
+    trap bootstrap_cleanup 0
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    chmod 700 "$BOOT_DIR" || return 1
+    BOOT_FILE="$BOOT_DIR/ddns.sh"
+    say '检测到流式执行入口：先从 GitHub 下载完整脚本并校验，再进入菜单。'
+    # 进程替换中的 $0 通常是 /dev/fd/63；原流已被 shell 读取，不能 cat "$0" 拼出完整文件。
+    # HTTPS 校验保持开启；-q 忽略默认 curl 配置，-f 拒绝 HTTP 错误页，下载失败不继续。
+    if ! curl -q -fLsS --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 1 \
+        --retry-max-time 150 --proto '=https' --proto-redir '=https' \
+        -o "$BOOT_FILE" "$SCRIPT_URL"; then
+        err '下载失败；未停止 DDNS 调度，也未迁移或覆盖配置。'
+        return 1
+    fi
+    if ! valid_script_source "$BOOT_FILE"; then
+        err "下载内容不完整、语法错误或版本不一致；请确认 GitHub 已上传完整 v$VERSION 文件。"
+        err '本次未停止 DDNS 调度，也未迁移或覆盖配置。'
+        return 1
+    fi
+    chmod 600 "$BOOT_FILE" || return 1
+    if [ "$BOOT_USE_TTY" = true ]; then
+        /bin/sh "$BOOT_FILE" "$@" < /dev/tty &
+    elif [ "$SOURCE_KIND" = stdin ]; then
+        /bin/sh "$BOOT_FILE" "$@" < /dev/null &
+    else
+        # 显式保留标准输入，避免后台子进程的菜单被重定向到 /dev/null。
+        /bin/sh "$BOOT_FILE" "$@" <&0 &
+    fi
+    BOOT_CHILD=$!
+    wait "$BOOT_CHILD"; BOOT_RC=$?
+    BOOT_CHILD=''
+    return "$BOOT_RC"
+}
+stage_install_source() {
+    # 必须在停止旧服务、迁移配置之前执行；暂存副本避免安装时再次读取易变源文件。
+    valid_script_source "$SELF" || {
+        err '安装源不是完整、可读的普通脚本文件；原调度和配置未改动。'; return 1;
+    }
+    INSTALL_SOURCE="$WORK/install-source.sh"
+    atomic_file "$INSTALL_SOURCE" 600 sh < "$SELF" && valid_script_source "$INSTALL_SOURCE" || {
+        err '暂存或校验安装源失败；原调度和配置未改动。'; return 1;
+    }
+}
 
 # ---------- 公共清理：恢复终端回显、结束子任务、清理含 Token 的临时文件 ----------
 cleanup() {
@@ -610,9 +693,10 @@ EOF
     fi
 }
 install_programs() {
-    [ -f "$SELF" ] && [ -s "$SELF" ] || { err '请把脚本保存成文件后执行，不支持 curl | sh 方式自安装。'; return 1; }
+    PROGRAM_SOURCE=${INSTALL_SOURCE:-$SELF}
+    valid_script_source "$PROGRAM_SOURCE" || { err '安装源校验失败，拒绝安装不完整的程序。'; return 1; }
     mkdir -p /usr/local/sbin || return 1
-    atomic_file "$MANAGER" 755 sh < "$SELF" || return 1
+    atomic_file "$MANAGER" 755 sh < "$PROGRAM_SOURCE" || return 1
     atomic_file "$RUNTIME" 755 sh <<EOF
 #!/bin/sh
 exec "$MANAGER" --run
@@ -691,7 +775,8 @@ remove_legacy_cron() {
 }
 install_all() (
     detect_init && install_deps && manage_begin || exit 1
-    # 先确认原配置可用，再停止原调度。
+    stage_install_source || exit 1
+    # 先确认安装源与原配置可用，再停止原调度。
     if [ -f "$CONFIG_FILE" ]; then
         need_config || exit 1
     elif [ -f "$LEGACY_CONFIG" ]; then
@@ -986,6 +1071,16 @@ main() {
         */*) SELF="$(pwd)/$0" ;;
         *) SELF=$(command -v "$0" 2>/dev/null) || SELF="$(pwd)/$0" ;;
     esac
+    case "$0" in
+        /dev/fd/*|/proc/*/fd/*) SOURCE_KIND=fd ;;
+        sh|bash|dash|ash|-sh|-bash|-dash|-ash|/bin/sh|/bin/bash|/bin/dash|/bin/ash|/usr/bin/sh|/usr/bin/bash|/usr/bin/dash|/usr/bin/ash)
+            SOURCE_KIND=stdin ;;
+        *) if [ -p "$SELF" ]; then SOURCE_KIND=fd; fi ;;
+    esac
+    if [ "$SOURCE_KIND" != file ]; then
+        bootstrap_stream "$@"
+        return $?
+    fi
     case "${1:---menu}" in
         --menu) main_menu ;;
         --run) run_once ;;
@@ -996,9 +1091,10 @@ main() {
         --version) say "$VERSION" ;;
         --help|-h)
             say '用法：cloudflare-ddns [--menu|--run|--status|--logs|--version]'
-            say '首次安装请将脚本保存为文件，以 root 执行 sh cloudflare-ddns-multi.sh。'
+            say '支持本地文件执行或 GitHub bash <(curl -fsSL URL)；管道菜单需要可用终端。'
             ;;
         *) err '未知参数，请使用 --help。'; return 2 ;;
     esac
 }
 main "$@"
+# CF_DDNS_SOURCE_END 2.0.2
