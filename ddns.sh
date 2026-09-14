@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cloudflare 多域名 DDNS 管理器 2.0.3
+# Cloudflare 多域名 DDNS 管理器 2.0.4
 # 用法：支持本地文件或 bash <(curl -fsSL GitHub原始链接)；安装后执行 cloudflare-ddns。
 # 保留 IPv4/A 记录模式；所有启用的域名同步为本机同一个直连出口 IPv4。
 # 支持 systemd / OpenRC；不修改系统 DNS、路由、时区及宿主机设置。
@@ -13,9 +13,9 @@ export PATH
 LC_ALL=C
 export LC_ALL
 
-VERSION='2.0.3'
+VERSION='2.0.4'
 # GitHub 进程替换/管道入口需要重新下载为普通文件；迁移仓库时修改此地址。
-# 仅启动安装/菜单入口时使用；安装后的定时同步不会从 GitHub 下载或自动升级。
+# 一键入口和菜单 13 在线更新时使用；定时同步不会从 GitHub 下载或自动升级。
 SCRIPT_URL='https://raw.githubusercontent.com/shini74744/jj/refs/heads/main/ddns.sh'
 INSTALL_SOURCE=''
 SOURCE_KIND='file'
@@ -25,6 +25,7 @@ CONFIG_DIR='/etc/cloudflare-ddns'
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LEGACY_CONFIG='/etc/cloudflare-ddns.env'
 MANAGER='/usr/local/sbin/cloudflare-ddns'
+MANAGER_BACKUP="$CONFIG_DIR/manager.previous.sh"
 RUNTIME='/usr/local/sbin/cloudflare-ddns-update'
 COMPAT='/root/cf_ddns.sh'
 LOOP='/usr/local/sbin/cloudflare-ddns-loop'
@@ -55,13 +56,84 @@ pause() { printf '按回车返回菜单...'; IFS= read -r _pause || :; }
 ask() { printf '%s' "$1"; IFS= read -r REPLY; }
 
 # ---------- GitHub 一键入口：先落盘、校验，再运行；绝不从已读过的管道复制自身 ----------
+# 只解析版本文本，不执行下载文件来获取版本；候选脚本的版本与结束标记必须自洽。
+script_file_version() (
+    [ -f "$1" ] && [ -s "$1" ] && [ -r "$1" ] || exit 1
+    SFV_BYTES=$(wc -c < "$1") || exit 1
+    [ "$SFV_BYTES" -le 1048576 ] || exit 1
+    [ "$(head -n 1 "$1")" = '#!/bin/sh' ] || exit 1
+    SFV_VERSION=$(sed -n "s/^VERSION='\([0-9][0-9.]*\)'$/\1/p" "$1") || exit 1
+    # 限定 X.Y.Z，限制每段长度，防止重复 VERSION、多行输出和不安全的版本字符串。
+    printf '%s\n' "$SFV_VERSION" | awk -F. '
+        NR!=1 || NF!=3 {exit 1}
+        {for(i=1;i<=3;i++) if($i !~ /^(0|[1-9][0-9]*)$/ || length($i)>6) exit 1}
+    ' || exit 1
+    [ "$(tail -n 1 "$1")" = "# CF_DDNS_SOURCE_END $SFV_VERSION" ] || exit 1
+    grep -Fqx 'main "$@"' "$1" || exit 1
+    /bin/sh -n "$1" || exit 1
+    printf '%s\n' "$SFV_VERSION"
+)
 valid_script_source() {
-    [ -f "$1" ] && [ -s "$1" ] && [ -r "$1" ] || return 1
-    [ "$(head -n 1 "$1")" = '#!/bin/sh' ] || return 1
-    grep -Fqx "VERSION='$VERSION'" "$1" || return 1
-    [ "$(tail -n 1 "$1")" = "# CF_DDNS_SOURCE_END $VERSION" ] || return 1
-    /bin/sh -n "$1" || return 1
+    VSS_VERSION=$(script_file_version "$1") || return 1
+    [ "$VSS_VERSION" = "$VERSION" ]
 }
+version_at_least() {
+    awk -v candidate="$1" -v current="$2" 'BEGIN {
+        split(candidate,a,"."); split(current,b,".")
+        for(i=1;i<=3;i++) {if(a[i]+0>b[i]+0) exit 0; if(a[i]+0<b[i]+0) exit 1}
+        exit 0
+    }'
+}
+check_download_version() {
+    DOWNLOAD_VERSION=$(script_file_version "$1") || {
+        err '下载内容不是完整 DDNS 脚本：版本/结束标记/语法检查未通过。'; return 1;
+    }
+    # 即使从旧下载文件打开菜单，也不得覆盖本机已经安装的更高版本。
+    MIN_SCRIPT_VERSION=$VERSION
+    INSTALLED_VERSION=$(script_file_version "$MANAGER" 2>/dev/null) || INSTALLED_VERSION=''
+    if [ -n "$INSTALLED_VERSION" ] && version_at_least "$INSTALLED_VERSION" "$MIN_SCRIPT_VERSION"; then
+        MIN_SCRIPT_VERSION=$INSTALLED_VERSION
+    fi
+    version_at_least "$DOWNLOAD_VERSION" "$MIN_SCRIPT_VERSION" || {
+        err "远端 v$DOWNLOAD_VERSION 低于当前 v$MIN_SCRIPT_VERSION，拒绝降级；请确认仓库已上传新版。"
+        return 1
+    }
+}
+# 每次调用使用新的随机查询参数，并要求缓存重新验证；不清理系统 DNS 或用户配置。
+# 这不是 GitHub CDN 的 purge 接口，不能使未提交的内容变成远端最新版本。
+fetch_latest_script() (
+    FLS_DEST=$1
+    command -v curl >/dev/null 2>&1 || { err '在线下载需要 curl。'; exit 1; }
+    FLS_PARENT=${FLS_DEST%/*}
+    [ "$FLS_PARENT" != "$FLS_DEST" ] || FLS_PARENT='.'
+    FLS_DIR=$(mktemp -d "$FLS_PARENT/.fetch.XXXXXXXX") || exit 1
+    trap 'rm -rf -- "$FLS_DIR"' 0
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    chmod 700 "$FLS_DIR" || exit 1
+    FLS_TIME=$(date +%s) || exit 1
+    FLS_NONCE="${FLS_TIME}-$$-${FLS_DIR##*.}"
+    case "$SCRIPT_URL" in
+        https://*) ;;
+        *) err '更新地址必须使用 HTTPS。'; exit 1 ;;
+    esac
+    case "$SCRIPT_URL" in
+        *\?*) FLS_URL="${SCRIPT_URL}&_ddns_refresh=$FLS_NONCE" ;;
+        *) FLS_URL="${SCRIPT_URL}?_ddns_refresh=$FLS_NONCE" ;;
+    esac
+    # -q 不读取 .curlrc；-f 拒绝 HTTP 错误页；不关闭证书校验，不发送 Token。
+    curl -q -fLsS --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 1 \
+        --retry-max-time 150 --max-filesize 1048576 --proto '=https' --proto-redir '=https' \
+        -H 'Cache-Control: no-cache, no-store, max-age=0' -H 'Pragma: no-cache' \
+        -o "$FLS_DIR/script.sh" "$FLS_URL" || {
+        err '拉取 GitHub 脚本失败；未覆盖本机程序。'; exit 1;
+    }
+    # 校验前不执行下载内容；即使响应为 HTTP 200，也要拒绝 HTML/截断/无效脚本。
+    script_file_version "$FLS_DIR/script.sh" >/dev/null || {
+        err 'GitHub 返回内容未通过脚本校验，本机程序未改动。'; exit 1;
+    }
+    atomic_file "$FLS_DEST" 600 sh < "$FLS_DIR/script.sh"
+)
 bootstrap_cleanup() {
     if [ -n "$BOOT_CHILD" ]; then
         kill -TERM "$BOOT_CHILD" 2>/dev/null || :
@@ -94,14 +166,12 @@ bootstrap_stream() {
     say '检测到流式执行入口：先从 GitHub 下载完整脚本并校验，再进入菜单。'
     # 进程替换中的 $0 通常是 /dev/fd/63；原流已被 shell 读取，不能 cat "$0" 拼出完整文件。
     # HTTPS 校验保持开启；-q 忽略默认 curl 配置，-f 拒绝 HTTP 错误页，下载失败不继续。
-    if ! curl -q -fLsS --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 1 \
-        --retry-max-time 150 --proto '=https' --proto-redir '=https' \
-        -o "$BOOT_FILE" "$SCRIPT_URL"; then
+    if ! fetch_latest_script "$BOOT_FILE"; then
         err '下载失败；未停止 DDNS 调度，也未迁移或覆盖配置。'
         return 1
     fi
-    if ! valid_script_source "$BOOT_FILE"; then
-        err "下载内容不完整、语法错误或版本不一致；请确认 GitHub 已上传完整 v$VERSION 文件。"
+    if ! check_download_version "$BOOT_FILE"; then
+        err '无法使用远端脚本；请确认 GitHub 已上传完整的当前版本或新版。' 
         err '本次未停止 DDNS 调度，也未迁移或覆盖配置。'
         return 1
     fi
@@ -990,6 +1060,46 @@ change_interval() (
     say '检查间隔已修改；暂停状态不变。OpenRC 在当前轮次/等待结束后读取新间隔。'
 )
 
+# ---------- 菜单在线更新：只替换主程序，不重装服务、不改动配置、不恢复已暂停任务 ----------
+# RUNTIME/COMPAT 每轮都 exec 同一路径，替换后下轮同步自动使用新代码。
+# OpenRC 常驻循环仍只负责调用 RUNTIME 与等待；本操作不改写服务定义。
+update_script() (
+    need_config && manage_begin || exit 1
+    [ -f "$MANAGER" ] && [ -x "$MANAGER" ] && [ -x "$RUNTIME" ] || {
+        err '尚未完整安装，请先选择菜单 1 安装当前脚本。'; exit 1;
+    }
+    say "当前菜单版本：v$VERSION"
+    say "更新来源：$SCRIPT_URL"
+    say '正在强制重新拉取：使用随机查询参数及 no-cache 请求头；保留所有配置和调度状态。'
+    UPDATE_FILE="$WORK/latest.sh"
+    fetch_latest_script "$UPDATE_FILE" && check_download_version "$UPDATE_FILE" || exit 1
+    say "远端脚本版本：v$DOWNLOAD_VERSION（同版本也会重新拉取并覆盖）"
+    # 只等待正在执行的同步结束，不调用 stop/start/enable/disable；失败也不改变暂停状态。
+    exec 9>"$RUN_LOCK" || exit 1
+    flock -w 30 9 || {
+        err '现有同步任务尚未结束，本次未覆盖程序；请在该轮结束后重新选择菜单 13。'; exit 1;
+    }
+    # 管理锁与运行锁都已持有，再备份当前主程序；不会把 Token 写进脚本备份。
+    atomic_file "$MANAGER_BACKUP" 700 < "$MANAGER" || {
+        err '旧脚本备份失败，未覆盖本机程序。'; exit 1;
+    }
+    if ! atomic_file "$MANAGER" 755 sh < "$UPDATE_FILE"; then
+        err "脚本替换失败；旧脚本备份保存在 $MANAGER_BACKUP。"
+        exit 1
+    fi
+    if ! cmp -s "$MANAGER" "$UPDATE_FILE"; then
+        if atomic_file "$MANAGER" 755 < "$MANAGER_BACKUP"; then
+            err '替换后内容核对失败，已恢复原脚本。'
+        else
+            err "替换后核对与回滚均失败，请用 $MANAGER_BACKUP 恢复程序。"
+        fi
+        exit 1
+    fi
+    say "脚本已更新为 v$DOWNLOAD_VERSION：$MANAGER"
+    say "上一份主程序备份：$MANAGER_BACKUP"
+    say '域名、Token、间隔、旧状态文件及自动同步启停状态均未修改；下一轮同步使用新版主程序。'
+)
+
 # ---------- 状态、手动同步、全局启停及卸载 ----------
 view_status() {
     need_config || return 1
@@ -1084,8 +1194,9 @@ main_menu() {
         printf ' 10. 修改检查间隔\n'
         printf ' 11. 暂停 / 恢复全部自动同步\n'
         printf ' 12. 卸载 DDNS\n'
+        printf ' 13. 在线更新脚本（GitHub 强制刷新缓存）\n'
         printf '  0. 退出\n'
-        ask '请选择 [0-12]：' || break
+        ask '请选择 [0-13]：' || break
         case "$REPLY" in
             1) install_all; pause ;;
             2) add_domains; pause ;;
@@ -1099,6 +1210,15 @@ main_menu() {
             10) change_interval; pause ;;
             11) toggle_schedule; pause ;;
             12) uninstall_all && break; pause ;;
+            13)
+                if update_script; then
+                    # 不返回当前进程的旧函数：直接加载刚安装的新版菜单。
+                    say '正在重新加载新版菜单...'
+                    exec /bin/sh "$MANAGER" --menu
+                else
+                    pause
+                fi
+                ;;
             0) break ;;
             *) err '无效选项。' ;;
         esac
@@ -1131,12 +1251,13 @@ main() {
         --status) view_status ;;
         --logs) view_logs ;;
         --version) say "$VERSION" ;;
+        --update) update_script ;;
         --help|-h)
-            say '用法：cloudflare-ddns [--menu|--run|--status|--logs|--version]'
+            say '用法：cloudflare-ddns [--menu|--run|--status|--logs|--version|--update]'
             say '支持本地文件执行或 GitHub bash <(curl -fsSL URL)；管道菜单需要可用终端。'
             ;;
         *) err '未知参数，请使用 --help。'; return 2 ;;
     esac
 }
 main "$@"
-# CF_DDNS_SOURCE_END 2.0.3
+# CF_DDNS_SOURCE_END 2.0.4
