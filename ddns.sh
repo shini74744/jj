@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cloudflare 多域名 DDNS 管理器 2.0.2
+# Cloudflare 多域名 DDNS 管理器 2.0.3
 # 用法：支持本地文件或 bash <(curl -fsSL GitHub原始链接)；安装后执行 cloudflare-ddns。
 # 保留 IPv4/A 记录模式；所有启用的域名同步为本机同一个直连出口 IPv4。
 # 支持 systemd / OpenRC；不修改系统 DNS、路由、时区及宿主机设置。
@@ -13,7 +13,7 @@ export PATH
 LC_ALL=C
 export LC_ALL
 
-VERSION='2.0.2'
+VERSION='2.0.3'
 # GitHub 进程替换/管道入口需要重新下载为普通文件；迁移仓库时修改此地址。
 # 仅启动安装/菜单入口时使用；安装后的定时同步不会从 GitHub 下载或自动升级。
 SCRIPT_URL='https://raw.githubusercontent.com/shini74744/jj/refs/heads/main/ddns.sh'
@@ -481,6 +481,40 @@ write_summary() {
         > "$WORK/summary.next" && atomic_file "$STATE_DIR/last-run.json" 600 < "$WORK/summary.next"
 }
 
+# ---------- 旧版状态兼容：只代表本轮全部启用域名已成功核对，不代表单个域名 ----------
+# 必须在整轮结束后调用；不能在 sync_one() 内让先成功的域名提前覆盖全局状态。
+# last-cloudflare-ip：全部启用域名均成功核对为同一出口 IP 时刷新。
+# last-update：在上述条件下，且本轮实际修改过至少一条 A 记录时才刷新（沿用 date -Is）。
+# 全部未变化时保留原更新时间；文件原本不存在时，不伪造一次 DNS 更新时间。
+# 部分失败、无启用域名、探测失败及限流轮次均不触碰这两个文件。
+# 以本轮配置快照为准；两个旧文件分别原子替换，不构成跨文件事务。
+write_legacy_compat() (
+    [ "$ACTIVE_COUNT" -gt 0 ] && [ "$FAIL_COUNT" -eq 0 ] &&
+        [ "$OK_COUNT" -eq "$ACTIVE_COUNT" ] || {
+        err '未满足全部启用域名成功条件，拒绝刷新旧版全局状态。'; exit 1;
+    }
+    is_public_ipv4 "$STABLE_IP" || { err '兼容状态的 IPv4 格式异常。'; exit 1; }
+    # 先检查本次要写入的所有目标，避免遇到目录/特殊文件时已更新了另一个文件。
+    for LEGACY_BASENAME in last-cloudflare-ip last-update; do
+        if [ "$LEGACY_BASENAME" = last-update ] && [ "$UPDATE_COUNT" -eq 0 ]; then continue; fi
+        LEGACY_TARGET="$STATE_DIR/$LEGACY_BASENAME"
+        if [ -d "$LEGACY_TARGET" ] ||
+            { [ -e "$LEGACY_TARGET" ] && [ ! -f "$LEGACY_TARGET" ] && [ ! -L "$LEGACY_TARGET" ]; }; then
+            err "旧版状态目标不是普通文件，拒绝覆盖：$LEGACY_TARGET"; exit 1
+        fi
+    done
+    printf '%s\n' "$STABLE_IP" > "$WORK/legacy-ip.next" || exit 1
+    if [ "$UPDATE_COUNT" -gt 0 ]; then
+        date -Is > "$WORK/legacy-update.next" || exit 1
+        [ -s "$WORK/legacy-update.next" ] || { err '旧版更新时间生成失败。'; exit 1; }
+    fi
+    atomic_file "$STATE_DIR/last-cloudflare-ip" 600 < "$WORK/legacy-ip.next" || exit 1
+    if [ "$UPDATE_COUNT" -gt 0 ]; then
+        atomic_file "$STATE_DIR/last-update" 600 < "$WORK/legacy-update.next" || exit 1
+    fi
+    exit 0
+)
+
 # ---------- 同步核心：一次探测、依次处理各域名；单个失败不跳过其他域名 ----------
 sync_one() {
     NAME=$(jq -r '.name' "$WORK/current") || return 1
@@ -551,6 +585,14 @@ sync_worker() {
     if [ "$FAIL_COUNT" -gt 0 ]; then
         write_summary partial "$RESULT_MESSAGE" || :
         log WARN "$RESULT_MESSAGE"; return 1
+    fi
+    # 逐域名 JSON 已保存；旧版全局状态必须等全部域名成功后才写入。
+    # 兼容文件写入失败属于本地状态错误，不掩盖错误，也不回滚已经完成的 DNS 修改。
+    if ! write_legacy_compat; then
+        RESULT_MESSAGE="$RESULT_MESSAGE；旧版状态文件写入失败，请检查目录权限、磁盘及目标类型；已完成的 DNS 修改不会回滚。"
+        write_summary error "$RESULT_MESSAGE" || :
+        log ERROR "$RESULT_MESSAGE"
+        return 1
     fi
     write_summary ok "$RESULT_MESSAGE" || return 1
     [ "$UPDATE_COUNT" -eq 0 ] || log INFO "$RESULT_MESSAGE"
@@ -1097,4 +1139,4 @@ main() {
     esac
 }
 main "$@"
-# CF_DDNS_SOURCE_END 2.0.2
+# CF_DDNS_SOURCE_END 2.0.3
