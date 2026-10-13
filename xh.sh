@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # 流量消耗/测速脚本（纯文本主菜单 + 实时行输出 + 看门狗 + 熔断 + 仅脚本限速 + CPU行为模拟 + 干净退出）
 # 关键修复：
-# - 先按②限速再按①开始后，前台“稳态阻塞”，绝不提前退出到 shell
+# - 主进程统一监督任务；独立进程组确保信号退出不遗留上传后代
 # - 阻塞用 kill -0 轮询子进程是否存活，完全移除 wait/-n 依赖
-# - 子进程清理逐个 kill，杜绝 “kill: 2:/dev/null…” 奇怪报错
+# - EXIT/INT/TERM/HUP 幂等清理；小数限速与慢请求心跳兼容
 # - Ctrl+C/HUP 都会触发 4 行简洁收尾；URL 全显；数字着色；作者/探针标红
 
 set -Euo pipefail
+set +m  # 每个后台任务用 setsid 创建独立进程组，不能开启 shell job control。
 
 AUTHOR="${AUTHOR:-大大怪}"
 PROBE_ADDR="${PROBE_ADDR:-nmsl.ma}"
@@ -110,6 +111,11 @@ LIMITER_PID=
 CPULIMIT_WATCHERS=()
 NONE_WARNED=0
 WATCHDOG_PID=
+WATCHDOG_NEXT=0
+SUMMARY_NEXT=0
+LIMITER_NEXT=0
+LIMITER_CYCLE=0
+RUNNING=0
 declare -A URL_FAILS URL_COOLDOWN
 
 # 工具
@@ -161,8 +167,8 @@ show_status(){
   [[ -f "$DL_TOTAL_FILE" ]] && dl_g=$(cat "$DL_TOTAL_FILE")
   [[ -f "$UL_TOTAL_FILE" ]] && ul_g=$(cat "$UL_TOTAL_FILE")
   local dl_thr="-" ul_thr="-"
-  (( DL_LIMIT_MB>0 && DL_THREADS>0 )) && dl_thr=$(awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
-  (( UL_LIMIT_MB>0 && UL_THREADS>0 )) && ul_thr=$(awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
+  positive_rate "$DL_LIMIT_MB" && (( DL_THREADS>0 )) && dl_thr=$(awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
+  positive_rate "$UL_LIMIT_MB" && (( UL_THREADS>0 )) && ul_thr=$(awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{printf "%.2f", mb/n}')
   local line; line="$(repeat_char "$cols" "-")"
   local summary_text=$([[ $SUMMARY_INTERVAL -gt 0 ]] && echo "每 ${SUMMARY_INTERVAL}s" || echo "关闭")
   local end_text=$([[ $END_TS -gt 0 ]] && date_human_ts "$END_TS" || echo "手动停止")
@@ -195,13 +201,15 @@ show_status(){
 }
 
 # 限速
-calc_dl_thread_bps(){ (( DL_LIMIT_MB>0 && DL_THREADS>0 )) && awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{v=mb*1048576/n; if(v<1)v=1; printf "%.0f", v}' || echo 0; }
-calc_ul_thread_bps(){ (( UL_LIMIT_MB>0 && UL_THREADS>0 )) && awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{v=mb*1048576/n; if(v<1)v=1; printf "%.0f", v}' || echo 0; }
+positive_rate(){ awk -v x="$1" 'BEGIN{exit !(x+0>0)}'; }
+calc_dl_thread_bps(){ positive_rate "$DL_LIMIT_MB" && (( DL_THREADS>0 )) && awk -v mb="$DL_LIMIT_MB" -v n="$DL_THREADS" 'BEGIN{v=mb*1048576/n; if(v<1)v=1; printf "%.0f", v}' || echo 0; }
+calc_ul_thread_bps(){ positive_rate "$UL_LIMIT_MB" && (( UL_THREADS>0 )) && awk -v mb="$UL_LIMIT_MB" -v n="$UL_THREADS" 'BEGIN{v=mb*1048576/n; if(v<1)v=1; printf "%.0f", v}' || echo 0; }
 
 # curl 封装
 append_nocache(){ local url="$1" tag="$2"; local s="nocache=$(date +%s%N)-${tag}-$RANDOM"; [[ "$url" == *\?* ]] && echo "${url}&${s}" || echo "${url}?${s}"; }
 curl_measure_dl_range(){
   local url="$1" range_end="$2" limit_bps="${3:-0}" extra=()
+  transfer_begin 3
   (( limit_bps>0 )) && extra+=(--limit-rate "$limit_bps")
   curl -sS -L "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
     --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
@@ -212,6 +220,7 @@ curl_measure_dl_range(){
 }
 curl_measure_full(){
   local url="$1" limit_bps="${2:-0}" extra=()
+  transfer_begin 4
   (( limit_bps>0 )) && extra+=(--limit-rate "$limit_bps")
   local max_bytes=$((128*1024*1024))
   curl -sS -L "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
@@ -225,6 +234,7 @@ curl_measure_full(){
 }
 curl_measure_upload(){
   local url="$1" bytes="$2" limit_bps="${3:-0}" extra=()
+  transfer_begin 3
   (( limit_bps>0 )) && extra+=(--limit-rate "$limit_bps")
   head -c "$bytes" /dev/zero | curl -sS -L "${CURL_IP_OPT[@]}" "${HTTP_VER_OPT[@]}" \
     --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
@@ -260,17 +270,69 @@ print_ul_status(){
     "$url"
 }
 
-# 清理（逐个 kill，避免 xargs/奇怪报错）
-safe_pkill_children(){
-  local sig="$1" ppid="$2"
-  if command -v pkill >/dev/null 2>&1; then
-    pkill -"${sig}" -P "$ppid" >/dev/null 2>&1 || true
-  else
-    local child
-    for child in $(ps -o pid= --ppid "$ppid" 2>/dev/null || true); do
-      kill -"${sig}" "$child" >/dev/null 2>&1 || true
-    done
-  fi
+
+# 所有需要清理的任务都由主进程创建，并保留独立的进程组。
+terminate_group(){
+  local pid="${1:-}"
+  [[ "$pid" =~ ^[0-9]+$ ]] && (( pid>1 && pid!=$$ )) || return 0
+  # setsid 完成前可能尚未创建组；同时处理已退出组长留下的后代。
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  sleep 0.1
+  kill -KILL -- "-$pid" 2>/dev/null || true
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+forget_worker(){
+  local old="$1" pid kept=()
+  for pid in "${PIDS[@]}"; do [[ "$pid" == "$old" ]] || kept+=("$pid"); done
+  PIDS=("${kept[@]}")
+}
+write_runtime_limits(){
+  [[ -n "$COUNTER_DIR" && -d "$COUNTER_DIR" ]] || return 0
+  printf '%s %s\n' "$DL_LIMIT_MB" "$UL_LIMIT_MB" > "$COUNTER_DIR/limits.new"
+  mv -f -- "$COUNTER_DIR/limits.new" "$COUNTER_DIR/limits"
+}
+worker_tick(){
+  [[ -r "$COUNTER_DIR/limits" ]] && read -r DL_LIMIT_MB UL_LIMIT_MB < "$COUNTER_DIR/limits"
+  : > "$COUNTER_DIR/hb.$WORKER_KIND.$WORKER_ID"
+  return 0
+}
+transfer_begin(){
+  # 心跳只在请求完成后更新；请求和重试期间不能按 20 秒阈值误杀。
+  local attempts="$1"
+  printf '%s\n' "$(( $(now_epoch) + CURL_MAX_TIME*attempts + WATCHDOG_STALL + 10 ))" > "$COUNTER_DIR/busy.$WORKER_KIND.$WORKER_ID"
+}
+transfer_end(){
+  : > "$COUNTER_DIR/hb.$WORKER_KIND.$WORKER_ID"
+  rm -f -- "$COUNTER_DIR/busy.$WORKER_KIND.$WORKER_ID"
+}
+prepare_worker_script(){
+  # 不重新读取 /dev/fd/63：这样也支持 bash <(curl ...) 启动方式。
+  {
+    printf 'set -uo pipefail\nset +m\n'
+    declare -p AUTHOR PROBE_ADDR END_TS CURL_IP_OPT HTTP_VER_OPT CURL_CONNECT_TIMEOUT CURL_MAX_TIME CURL_SPEED_TIME CURL_SPEED_LIMIT ALWAYS_CHUNK CHUNK_MB_DL CHUNK_MB_UL COUNTER_DIR DL_TOTAL_FILE UL_TOTAL_FILE DL_LIMIT_MB UL_LIMIT_MB DL_THREADS UL_THREADS ACTIVE_URLS ACTIVE_UPLOAD_URLS URL_FAILS URL_COOLDOWN CGROUP_DIR WATCHDOG_STALL
+    declare -p C_RESET C_BOLD C_DIM C_RED C_GREEN C_BLUE C_YELLOW C_MAGENTA C_CYAN C_WHITE
+    declare -f
+    cat <<'WORKER'
+trap 'exit 0' INT TERM HUP
+WORKER_KIND="$1"; WORKER_ID="$2"
+if [[ -n "$CGROUP_DIR" && -w "$CGROUP_DIR/cgroup.procs" ]]; then
+  printf '%s\n' "$$" > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
+fi
+if [[ "$WORKER_KIND" == dl ]]; then download_worker "$WORKER_ID"; else upload_worker "$WORKER_ID"; fi
+WORKER
+  } > "$COUNTER_DIR/worker.sh"
+  chmod 600 "$COUNTER_DIR/worker.sh"
+}
+spawn_worker(){
+  local kind="$1" id="$2" pid
+  : > "$COUNTER_DIR/hb.$kind.$id"
+  rm -f -- "$COUNTER_DIR/busy.$kind.$id"
+  setsid bash "$COUNTER_DIR/worker.sh" "$kind" "$id" &
+  pid=$!
+  PIDS+=("$pid")
+  if [[ "$kind" == dl ]]; then DL_PIDS["$id"]=$pid; else UL_PIDS["$id"]=$pid; fi
 }
 
 # CPU 限制
@@ -282,61 +344,78 @@ detect_limit_method(){
     else LIMIT_METHOD="none"; fi
   fi
 }
-is_scheduler_running(){ [[ -n "${LIMITER_PID:-}" ]] && kill -0 "$LIMITER_PID" 2>/dev/null; }
-kill_scheduler(){ is_scheduler_running && { kill -TERM "$LIMITER_PID" >/dev/null 2>&1 || true; wait "$LIMITER_PID" >/dev/null 2>&1 || true; LIMITER_PID=; }; }
-kill_cpulimit_watchers(){ ((${#CPULIMIT_WATCHERS[@]})) && { for wp in "${CPULIMIT_WATCHERS[@]}"; do kill -TERM "$wp" >/dev/null 2>&1 || true; done; CPULIMIT_WATCHERS=(); }; }
+
+is_scheduler_running(){ (( LIMITER_NEXT>0 )); }
+kill_scheduler(){ LIMITER_NEXT=0; LIMITER_PID=; return 0; }
+kill_cpulimit_watchers(){
+  local pid
+  for pid in "${CPULIMIT_WATCHERS[@]}"; do terminate_group "$pid"; done
+  CPULIMIT_WATCHERS=()
+  return 0
+}
 cgroup_enter_self(){
-  set +e
-  [[ "$LIMIT_METHOD" != "cgroup" ]] && { set -e; return 0; }
-  if [[ -w /sys/fs/cgroup/cgroup.subtree_control ]]; then grep -qw cpu /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || echo +cpu > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; fi
-  [[ -z "$CGROUP_DIR" ]] && { CGROUP_DIR="/sys/fs/cgroup/vpsburn.$$"; mkdir -p "$CGROUP_DIR" 2>/dev/null || true; }
-  [[ -w "$CGROUP_DIR/cgroup.procs" ]] && echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
-  set -e
+  # 只把本脚本的 worker 放入专用组，主控留在原组；不改宿主根控制器。
+  [[ "$LIMIT_METHOD" == cgroup ]] || return 0
+  if [[ -z "$CGROUP_DIR" ]]; then
+    CGROUP_DIR="/sys/fs/cgroup/vpsburn.$$"
+    if ! mkdir -- "$CGROUP_DIR" 2>/dev/null; then CGROUP_DIR=; LIMIT_METHOD=none; return 0; fi
+  fi
+  if [[ ! -w "$CGROUP_DIR/cpu.max" ]]; then
+    rmdir -- "$CGROUP_DIR" 2>/dev/null || true
+    CGROUP_DIR=; LIMIT_METHOD=none
+  fi
+  return 0
 }
 cgroup_set_percent(){
-  set +e
-  local pct="$1"; [[ "$LIMIT_METHOD" != "cgroup" || -z "$CGROUP_DIR" ]] && { set -e; return 0; }
-  local period=${CGROUP_PERIOD_US}
-  if (( pct<=0 || pct>=100 )); then echo "max" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true; set -e; return 0; fi
-  local n; n=$(cores_count); local quota; quota=$(awk -v P="$period" -v N="$n" -v R="$pct" 'BEGIN{printf "%.0f", P*N*R/100}')
-  echo "$quota $period" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
-  set -e
+  local pct="$1" period="$CGROUP_PERIOD_US" n quota
+  [[ "$LIMIT_METHOD" == cgroup && -n "$CGROUP_DIR" ]] || return 0
+  if (( pct<=0 || pct>=100 )); then quota=max
+  else n=$(cores_count); quota=$(awk -v P="$period" -v N="$n" -v R="$pct" 'BEGIN{printf "%.0f", P*N*R/100}'); fi
+  printf '%s %s\n' "$quota" "$period" > "$CGROUP_DIR/cpu.max" 2>/dev/null || true
+  return 0
 }
 cpulimit_apply_for_pids(){
-  local pct="$1"; command -v cpulimit >/dev/null 2>&1 || return 0; ((${#PIDS[@]})) || return 0
-  local inc=""; cpulimit -h 2>&1 | grep -qE -- '-z|children' && inc="-z"
-  for pid in "${PIDS[@]}"; do cpulimit -p "$pid" -l "$pct" $inc -b >/dev/null 2>&1 & CPULIMIT_WATCHERS+=("$!"); done
+  local pct="$1" inc="" pid
+  kill_cpulimit_watchers
+  command -v cpulimit >/dev/null 2>&1 || return 0
+  cpulimit -h 2>&1 | grep -qE -- '-z|children' && inc=-z
+  for pid in "${PIDS[@]}"; do
+    # 不使用 -b 再次脱离；整个限制器组由主进程负责回收。
+    setsid cpulimit -p "$pid" -l "$pct" $inc >/dev/null 2>&1 &
+    CPULIMIT_WATCHERS+=("$!")
+  done
+  return 0
 }
+
 calc_cpulimit_per_proc(){ local tp="$1" nc; nc=$(cores_count); local np=${#PIDS[@]}; ((np<1))&&np=1; awk -v tp="$tp" -v nc="$nc" -v np="$np" 'BEGIN{v=tp*nc/np; if(v<1)v=1; if(v>100)v=100; printf "%.0f", v}'; }
 limit_apply_percent(){
-  set +e
   local pct="$1"; detect_limit_method
   case "$LIMIT_METHOD" in
     cgroup)  cgroup_set_percent "$pct" ;;
     cpulimit) if (( pct>=100 )); then kill_cpulimit_watchers; else local per; per=$(calc_cpulimit_per_proc "$pct"); cpulimit_apply_for_pids "$per"; fi ;;
     *) : ;; # 静默，不再打印 CPU 能力告警
   esac
-  set -e
+  return 0
 }
 rand_between(){ local min="$1" max="$2"; echo $(( RANDOM % (max - min + 1) + min )); }
-normal_usage_scheduler(){
-  local cycle=0
-  while true; do
-    cycle=$((cycle+1))
-    local hour; hour=$(date +%H)
-    local base_min base_max burst_p burst_min burst_max
-    if   ((8<=10#$hour && 10#$hour<19)); then base_min=10; base_max=35; burst_p=20; burst_min=40; burst_max=65
-    elif ((1<=10#$hour && 10#$hour<6)); then base_min=3; base_max=12; burst_p=5;  burst_min=20; burst_max=30
-    else base_min=6; base_max=25; burst_p=10; burst_min=30; burst_max=50; fi
-    local target dur
-    if (( cycle % $(rand_between 6 10) == 0 )); then target=$(rand_between 2 5); dur=$(rand_between 5 15); limit_apply_percent "$target"; sleep "$dur"; continue; fi
-    if (( RANDOM % 100 < burst_p )); then target=$(rand_between "$burst_min" "$burst_max"); dur=$(rand_between 10 45)
-    else target=$(rand_between "$base_min" "$base_max"); dur=$(rand_between 30 180); fi
-    (( target<1 )) && target=1; (( target>90 )) && target=90
-    limit_apply_percent "$target"; sleep "$dur"
-  done
+
+normal_usage_tick(){
+  (( LIMIT_MODE==2 && $(now_epoch)>=LIMITER_NEXT )) || return 0
+  local hour target dur base_min base_max burst_p burst_min burst_max
+  LIMITER_CYCLE=$((LIMITER_CYCLE+1))
+  hour=$(date +%H)
+  if (( 8<=10#$hour && 10#$hour<19 )); then base_min=10; base_max=35; burst_p=20; burst_min=40; burst_max=65
+  elif (( 1<=10#$hour && 10#$hour<6 )); then base_min=3; base_max=12; burst_p=5; burst_min=20; burst_max=30
+  else base_min=6; base_max=25; burst_p=10; burst_min=30; burst_max=50; fi
+  if (( LIMITER_CYCLE % $(rand_between 6 10) == 0 )); then target=$(rand_between 2 5); dur=$(rand_between 5 15)
+  elif (( RANDOM%100<burst_p )); then target=$(rand_between "$burst_min" "$burst_max"); dur=$(rand_between 10 45)
+  else target=$(rand_between "$base_min" "$base_max"); dur=$(rand_between 30 180); fi
+  limit_apply_percent "$target"
+  LIMITER_NEXT=$(( $(now_epoch)+dur ))
+  return 0
 }
-start_normal_usage(){ is_scheduler_running || { normal_usage_scheduler & LIMITER_PID=$!; echo "${C_GREEN}[*] 已启用：模拟正常使用。${C_RESET}"; }; }
+start_normal_usage(){ LIMITER_CYCLE=0; LIMITER_NEXT=0; normal_usage_tick; echo "${C_GREEN}[*] 已启用：模拟正常使用。${C_RESET}"; }
+
 stop_normal_usage(){ kill_scheduler; }
 limit_set_mode(){
   local mode="$1"; detect_limit_method
@@ -348,13 +427,15 @@ limit_set_mode(){
 }
 
 # 线程
-spawn_dl(){ local id="$1"; download_worker "$id" & local pid=$!; DL_PIDS["$id"]=$pid; PIDS+=("$pid"); }
-spawn_ul(){ local id="$1"; upload_worker "$id" & local pid=$!; UL_PIDS["$id"]=$pid; PIDS+=("$pid"); }
+
+spawn_dl(){ spawn_worker dl "$1"; }
+spawn_ul(){ spawn_worker ul "$1"; }
 
 download_worker(){
   local id="$1" sum=0
   while true; do
     (( END_TS>0 && $(date +%s) >= END_TS )) && break
+    worker_tick
     local url final limit_bps bytes=0 time_s=0 code="000"
     url="$(pick_active_dl_url)"; final="$(append_nocache "$url" "dl-$id")"; limit_bps=$(calc_dl_thread_bps)
     if (( ALWAYS_CHUNK )); then
@@ -368,6 +449,7 @@ download_worker(){
         local r2; r2=$(curl_measure_dl_range "$final" "$range_end" "$limit_bps"); [[ -n "$r2" ]] && bytes="${r2%% *}" time_s="${r2#* }"
       fi
     fi
+    transfer_end
     (( bytes>0 )) && mark_url_ok "$url" || mark_url_fail "$url"
     sum=$((sum+bytes)); print_dl_status "$id" "$final" "$bytes" "$sum" "$time_s"
   done
@@ -377,11 +459,13 @@ upload_worker(){
   local id="$1" sum=0
   while true; do
     (( END_TS>0 && $(date +%s) >= END_TS )) && break
+    worker_tick
     local url final limit_bps chunk res bytes=0 code="000" time_s=0
     url="$(pick_active_ul_url)"; final="$(append_nocache "$url" "ul-$id")"; limit_bps=$(calc_ul_thread_bps); chunk=$(( CHUNK_MB_UL*1048576 ))
     res="$(curl_measure_upload "$final" "$chunk" "$limit_bps")"
     if [[ -n "$res" ]]; then bytes="${res%% *}"; res="${res#* }"; time_s="${res%% *}"; res="${res#* }"; code="${res%% *}"; fi
     [[ "$code" =~ ^(200|201|202|204)$ ]] || bytes=0
+    transfer_end
     (( bytes>0 )) && mark_url_ok "$url" || mark_url_fail "$url"
     sum=$((sum+bytes)); print_ul_status "$id" "$final" "$bytes" "$sum" "$time_s"
   done
@@ -390,50 +474,53 @@ upload_worker(){
 # 汇总
 bytes_from_file(){ [[ -f "$1" ]] && cat "$1" || echo 0; }
 print_summary_once(){ local dl ul; dl=$(bytes_from_file "$DL_TOTAL_FILE"); ul=$(bytes_from_file "$UL_TOTAL_FILE"); echo "${C_BOLD}[Summary ${C_DIM}$(human_now)${C_RESET}${C_BOLD}]${C_RESET} 下载: ${C_CYAN}$(bytes_to_mb "$dl") MB${C_RESET} | 上传: ${C_MAGENTA}$(bytes_to_mb "$ul") MB${C_RESET}"; }
-summary_worker(){ while true; do sleep "$SUMMARY_INTERVAL"; print_summary_once; done; }
-is_summary_running(){ [[ -n "${SUMMARY_PID:-}" ]] && kill -0 "$SUMMARY_PID" 2>/dev/null; }
-start_summary(){ (( SUMMARY_INTERVAL>0 )) || return 0; is_summary_running && echo "${C_YELLOW}[*] 定时汇总已在运行。${C_RESET}" || { summary_worker & SUMMARY_PID=$!; echo "${C_GREEN}[*] 已开启定时汇总（每 ${SUMMARY_INTERVAL}s）。${C_RESET}"; }; }
-stop_summary(){ is_summary_running && { kill -TERM "$SUMMARY_PID" >/dev/null 2>&1 || true; wait "$SUMMARY_PID" >/dev/null 2>&1 || true; SUMMARY_PID=; echo "${C_GREEN}[+] 已停止定时汇总。${C_RESET}"; }; }
 
-# 看门狗
-watchdog_loop(){
-  while true; do
-    sleep "$WATCHDOG_INTERVAL"
-    (( WATCHDOG_ENABLE==1 )) || continue
-    local now; now=$(now_epoch)
-
-    for id in "${!DL_PIDS[@]}"; do
-      local hb="$COUNTER_DIR/hb.dl.$id" pid="${DL_PIDS[$id]:-}"; [[ -z "$pid" ]] && continue
-      if kill -0 "$pid" 2>/dev/null; then
-        local mt=0; [[ -f "$hb" ]] && mt=$(stat -c %Y "$hb" 2>/dev/null || stat -f %m "$hb" 2>/dev/null || echo 0)
-        if (( mt>0 && now-mt > WATCHDOG_STALL )); then
-          if (( WATCHDOG_MAX_RESTARTS==0 || ${DL_RESTARTS[$id]:-0} < WATCHDOG_MAX_RESTARTS )); then
-            echo "${C_YELLOW}[WD] DL#$id 心跳超时（>${WATCHDOG_STALL}s），重启…${C_RESET}"
-            safe_pkill_children TERM "$pid"; kill -TERM "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true
-            DL_RESTARTS["$id"]=$(( ${DL_RESTARTS[$id]:-0} + 1 )); spawn_dl "$id"
-          fi
-        fi
-      fi
-    done
-
-    for id in "${!UL_PIDS[@]}"; do
-      local hb="$COUNTER_DIR/hb.ul.$id" pid="${UL_PIDS[$id]:-}"; [[ -z "$pid" ]] && continue
-      if kill -0 "$pid" 2>/dev/null; then
-        local mt=0; [[ -f "$hb" ]] && mt=$(stat -c %Y "$hb" 2>/dev/null || stat -f %m "$hb" 2>/dev/null || echo 0)
-        if (( mt>0 && now-mt > WATCHDOG_STALL )); then
-          if (( WATCHDOG_MAX_RESTARTS==0 || ${UL_RESTARTS[$id]:-0} < WATCHDOG_MAX_RESTARTS )); then
-            echo "${C_YELLOW}[WD] UL#$id 心跳超时（>${WATCHDOG_STALL}s），重启…${C_RESET}"
-            safe_pkill_children TERM "$pid"; kill -TERM "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true
-            UL_RESTARTS["$id"]=$(( ${UL_RESTARTS[$id]:-0} + 1 )); spawn_ul "$id"
-          fi
-        fi
-      fi
-    done
-  done
+is_summary_running(){ [[ -n "$SUMMARY_PID" ]]; }
+start_summary(){ SUMMARY_PID=enabled; SUMMARY_NEXT=$(( $(now_epoch)+SUMMARY_INTERVAL )); return 0; }
+stop_summary(){ SUMMARY_PID=; SUMMARY_NEXT=0; return 0; }
+summary_tick(){
+  if [[ -n "$SUMMARY_PID" ]] && (( SUMMARY_INTERVAL>0 && $(now_epoch)>=SUMMARY_NEXT )); then
+    print_summary_once
+    SUMMARY_NEXT=$(( $(now_epoch)+SUMMARY_INTERVAL ))
+  fi
+  return 0
 }
+# 看门狗必须在主进程运行，重启后的 PID 才能被停止流程准确回收。
+watchdog_tick(){
+  (( WATCHDOG_ENABLE==1 && $(now_epoch)>=WATCHDOG_NEXT )) || return 0
+  local now kind id pid hb busy deadline mt reason restarted=0
+  now=$(now_epoch); WATCHDOG_NEXT=$((now+WATCHDOG_INTERVAL))
+  for kind in dl ul; do
+    local -n workers="${kind^^}_PIDS" restarts="${kind^^}_RESTARTS"
+    for id in "${!workers[@]}"; do
+      pid=${workers[$id]}; hb="$COUNTER_DIR/hb.$kind.$id"; busy="$COUNTER_DIR/busy.$kind.$id"
+      reason=
+      if ! kill -0 "$pid" 2>/dev/null; then reason=exited
+      elif [[ -r "$busy" ]]; then
+        deadline=0; read -r deadline < "$busy" || true
+        [[ "$deadline" =~ ^[0-9]+$ ]] && (( now>deadline )) && reason=timeout
+      else
+        mt=$(stat -c %Y "$hb" 2>/dev/null || echo "$now")
+        (( now-mt>WATCHDOG_STALL )) && reason=stalled
+      fi
+      [[ -n "$reason" ]] || continue
+      terminate_group "$pid"; forget_worker "$pid"; unset 'workers[$id]'
+      if (( END_TS>0 && now>=END_TS )); then continue; fi
+      if (( WATCHDOG_MAX_RESTARTS>0 && ${restarts[$id]:-0}>=WATCHDOG_MAX_RESTARTS )); then continue; fi
+      restarts[$id]=$(( ${restarts[$id]:-0}+1 ))
+      echo "[WD] $kind#$id $reason; restarting"
+      spawn_worker "$kind" "$id"; restarted=1
+    done
+    unset -n workers restarts
+  done
+  if (( restarted && LIMIT_MODE==1 )); then limit_apply_percent 50; fi
+  if (( restarted && LIMIT_MODE==2 )); then LIMITER_NEXT=0; fi
+  return 0
+}
+controller_tick(){ watchdog_tick; summary_tick; normal_usage_tick; return 0; }
 
 # 启停
-init_and_check(){ check_curl || return 1; init_counters; }
+init_and_check(){ check_curl || return 1; command -v setsid >/dev/null || { echo "[-] 需要 setsid（util-linux）以安全回收任务"; return 1; }; init_counters; }
 wait_first_output(){
   (( START_WAIT_FIRST_OUTPUT )) || return 0
   for ((i=0;i<START_WAIT_SPINS;i++)); do
@@ -458,8 +545,10 @@ smart_split_threads(){
 
 start_consumption(){
   local mode="$1" dn="$2" un="$3"
+  (( RUNNING==0 )) || { echo "[-] 请先停止当前任务"; return 1; }
   [[ "$mode" =~ ^(d|u|b)$ ]] || { echo "[-] 内部错误：mode 无效"; return 1; }
   init_and_check || { echo "${C_RED}无法启动：初始化失败。${C_RESET}"; return 1; }
+  RUNNING=1; WATCHDOG_NEXT=0
   MODE="$mode"; PIDS=(); DL_PIDS=(); UL_PIDS=(); DL_RESTARTS=(); UL_RESTARTS=(); STOPPED=0
   echo "${C_BOLD}[*] $(human_now) 启动：模式=${MODE}  下载线程=${dn}  上传线程=${un}${C_RESET}"
   echo "${C_BOLD}[*] 作者: ${C_RED}${AUTHOR}${C_RESET} | 探针: ${C_RED}${PROBE_ADDR}${C_RESET}"
@@ -467,11 +556,14 @@ start_consumption(){
   (( END_TS>0 )) && echo "[*] 预计停止于：$(date_human_ts "$END_TS")"
   (( LIMIT_MODE>0 )) && { detect_limit_method; [[ "$LIMIT_METHOD" == "cgroup" ]] && cgroup_enter_self; }
 
+  write_runtime_limits
+  prepare_worker_script
   if [[ "$MODE" != "u" ]] && (( dn>0 )); then for ((i=1;i<=dn;i++)); do : > "$COUNTER_DIR/hb.dl.$i"; spawn_dl "$i"; sleep 0.05; done; fi
   if [[ "$MODE" != "d" ]] && (( un>0 )); then for ((i=1;i<=un;i++)); do : > "$COUNTER_DIR/hb.ul.$i"; spawn_ul "$i"; sleep 0.05; done; fi
 
   start_summary
-  if (( WATCHDOG_ENABLE==1 )); then watchdog_loop & WATCHDOG_PID=$!; fi
+  if (( LIMIT_MODE==1 )); then limit_apply_percent 50; fi
+  if (( LIMIT_MODE==2 )); then LIMITER_NEXT=0; normal_usage_tick; fi
   echo "${C_GREEN}[+] 全部线程已启动（共 ${#PIDS[@]}）。按 Ctrl+C 可停止。${C_RESET}"
   wait_first_output
   # 注意：此处不再调用 wait/-n，阻塞用 block_loop 实现
@@ -485,54 +577,41 @@ block_loop(){
       stop_consumption
       break
     fi
+    controller_tick
     # 侦测是否还有任何子进程活着
     local alive=0
-    for pid in "${PIDS[@]}" "${WATCHDOG_PID:-}" "${SUMMARY_PID:-}" "${LIMITER_PID:-}"; do
+    for pid in "${PIDS[@]}"; do
       [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null && { alive=1; break; }
     done
-    (( alive==1 )) || break
+    if (( alive==0 )); then stop_consumption; break; fi
     sleep 1
   done
 }
 
+
 stop_consumption(){
-  (( STOPPED==1 )) && return 0
+  (( STOPPED==0 )) || return 0
   STOPPED=1
-
-  if [[ -n "${WATCHDOG_PID:-}" ]] && kill -0 "$WATCHDOG_PID" 2>/dev/null; then
-    kill -TERM "$WATCHDOG_PID" >/dev/null 2>&1 || true
-    wait "$WATCHDOG_PID" >/dev/null 2>&1 || true
-    WATCHDOG_PID=
-  fi
-
+  local saved_traps pid dl_g=0 ul_g=0
+  saved_traps=$(trap -p INT TERM HUP)
+  trap '' INT TERM HUP
   kill_scheduler
-  limit_apply_percent 100
-
-  if ((${#PIDS[@]}>0)); then
-    echo "${C_BOLD}[*] $(human_now) 正在停止全部线程…${C_RESET}"
-    for pid in "${PIDS[@]}"; do
-      safe_pkill_children TERM "$pid"; kill -TERM "$pid" >/dev/null 2>&1 || true
-    done
-    sleep 0.4
-    for pid in "${PIDS[@]}"; do
-      safe_pkill_children KILL "$pid" >/dev/null 2>&1 || true
-      kill -KILL "$pid" >/dev/null 2>&1 || true
-      wait "$pid" >/dev/null 2>&1 || true
-    done
-    PIDS=(); DL_PIDS=(); UL_PIDS=()
-  fi
-
-  kill_cpulimit_watchers
   stop_summary
-
-  local dl_g=0 ul_g=0
+  kill_cpulimit_watchers
+  for pid in "${PIDS[@]}"; do terminate_group "$pid"; done
+  PIDS=(); DL_PIDS=(); UL_PIDS=()
   [[ -f "$DL_TOTAL_FILE" ]] && dl_g=$(cat "$DL_TOTAL_FILE")
   [[ -f "$UL_TOTAL_FILE" ]] && ul_g=$(cat "$UL_TOTAL_FILE")
-  echo "${C_BOLD}[*] 最终汇总：下载总计 ${C_CYAN}$(bytes_to_mb "$dl_g") MB${C_RESET}${C_BOLD}；上传总计 ${C_MAGENTA}$(bytes_to_mb "$ul_g") MB${C_RESET}"
-
+  if (( RUNNING )); then
+    echo "[*] 最终汇总：下载 $(bytes_to_mb "$dl_g") MB；上传 $(bytes_to_mb "$ul_g") MB"
+    echo "[+] 已全部停止。"
+  fi
   cleanup_counters
-  [[ -n "${CGROUP_DIR:-}" ]] && rmdir "$CGROUP_DIR" >/dev/null 2>&1 || true
-  echo "${C_GREEN}[+] 已全部停止。${C_RESET}"
+  COUNTER_DIR=; DL_TOTAL_FILE=; UL_TOTAL_FILE=
+  if [[ -n "$CGROUP_DIR" ]]; then rmdir -- "$CGROUP_DIR" 2>/dev/null || true; CGROUP_DIR=; fi
+  RUNNING=0; WATCHDOG_NEXT=0
+  eval "$saved_traps"
+  return 0
 }
 
 # 交互
@@ -575,7 +654,7 @@ interactive_start(){
   else DL_THREADS=0; UL_THREADS="$total_threads"; fi
 
   # 启动
-  start_consumption "$MODE" "$DL_THREADS" "$UL_THREADS"
+  start_consumption "$MODE" "$DL_THREADS" "$UL_THREADS" || return 0
 
   # 开始后前台阻塞（稳定、与 bash <(curl …) 兼容）
   if (( FOLLOW_AFTER_START==1 )); then
@@ -597,6 +676,7 @@ configure_limits(){
     4) DL_LIMIT_MB=0; UL_LIMIT_MB=0; echo "${C_GREEN}[+] 已清除全部限速。${C_RESET}";;
     *) echo "${C_YELLOW}无效选择。${C_RESET}";;
   esac
+  write_runtime_limits
 }
 configure_cpu_limit_mode(){
   echo "${C_BOLD}限制模式（CPU）：${C_RESET}当前 = $(case "$LIMIT_MODE" in 0) echo 关闭;; 1) echo 恒定50%;; 2) echo 模拟正常使用;; esac)"
@@ -606,20 +686,37 @@ configure_cpu_limit_mode(){
   echo "${C_DIM}说明：优先 cgroup v2；否则退回 cpulimit；模拟模式周期性调整目标负载并穿插短突发与休息窗口。${C_RESET}"
 }
 
-# Trap：Ctrl+C / 断开 SSH 都能触发
+
+# EXIT 覆盖普通退出和 shell 错误；信号只触发一次幂等清理。
 exit_cleanup(){
-  echo "${C_YELLOW}[!] 捕获到信号，正在清理…${C_RESET}"
+  local code="${1:-0}"
+  trap '' INT TERM HUP
   stop_consumption
-  (( EXIT_AFTER_STOP==1 )) && exit 0
+  exit "$code"
 }
-trap 'exit_cleanup' INT TERM HUP
+install_cleanup_traps(){
+  trap 'exit_cleanup 130' INT
+  trap 'exit_cleanup 143' TERM
+  trap 'exit_cleanup 129' HUP
+  trap 'rc=$?; trap - EXIT; set +e; stop_consumption; exit "$rc"' EXIT
+}
 
 # 菜单循环
 menu(){
   while true; do
     echo
     show_status
-    read -rp "${C_BOLD}请选择 [0-6] > ${C_RESET}" c || true
+    if (( RUNNING )); then
+      controller_tick
+      if (( END_TS>0 && $(now_epoch)>=END_TS )); then stop_consumption; continue; fi
+      c=
+      if ! read -r -t 1 c; then
+        [[ -t 0 ]] || { stop_consumption; return 0; }
+        continue
+      fi
+    else
+      read -rp "${C_BOLD}请选择 [0-6] > ${C_RESET}" c || return 0
+    fi
     case "${c:-}" in
       1) interactive_start ;;                         # 开始后阻塞，停止后退出或返回
       2) configure_cpu_limit_mode ;;
@@ -635,4 +732,7 @@ menu(){
   done
 }
 
-menu
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  install_cleanup_traps
+  menu
+fi
